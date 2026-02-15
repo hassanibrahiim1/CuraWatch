@@ -13,6 +13,7 @@
 //  MPU6050: 0x68 (default)
 
 #include <Wire.h>
+#include <WiFi.h>
 #include "MAX30102Sensor.h"
 #include "HeartRateMonitor.h"
 #include "StepDetector.h"
@@ -32,6 +33,23 @@ StepDetector stepDetector;
 static int sampleCounter = 0;
 static int displayCounter = 0;
 static unsigned long lastUpdateTime = 0;
+static unsigned long lastWiFiScanTime = 0;
+
+// ============= WiFi KNOWN APs =============
+struct KnownAP {
+  const char* name;
+  const char* macAddress;
+};
+
+const KnownAP knownAPs[] = {
+  {"Hassan", "6a:bb:30:8c:73:4f"},
+  {"Fatma", "ee:27:8a:bf:0a:65"},
+  {"Router", "58:d7:59:6c:fa:d0"}
+};
+
+const int NUM_KNOWN_APS = sizeof(knownAPs) / sizeof(knownAPs[0]);
+
+#define WiFi_SCAN_INTERVAL 5000  // Scan WiFi every 5 seconds
 
 // ============= SETUP =============
 void setup()
@@ -73,6 +91,20 @@ void setup()
   delay(500);
   Serial.println("\n=== All Sensors Ready ===\n");
   delay(2500);
+
+  // Initialize WiFi in station mode (scan only, no connection)
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();  // Turn off auto-connect
+  delay(100);
+  Serial.println("\n=== WiFi Scanner Ready ===");
+  Serial.println("Known Access Points (Whitelist):");
+  for (int i = 0; i < NUM_KNOWN_APS; i++) {
+    Serial.print("  ");
+    Serial.print(knownAPs[i].name);
+    Serial.print(": ");
+    Serial.println(knownAPs[i].macAddress);
+  }
+  Serial.println();
 }
 
 // ============= MAIN LOOP =============
@@ -114,6 +146,12 @@ void loop()
       displayCombinedData();
     }
     displayCounter = 0;
+  }
+
+  // Perform WiFi scan at specified interval
+  if (millis() - lastWiFiScanTime >= WiFi_SCAN_INTERVAL) {
+    findClosestKnownAP();
+    lastWiFiScanTime = millis();
   }
 }
 
@@ -218,4 +256,119 @@ void displaySimplifiedData()
   Serial.print(" | Accel: ");
   Serial.print(stepDetector.getAccelMagnitude());
   Serial.println(" m/s²");
+}
+
+// ============= WiFi SCANNING FUNCTIONS =============
+/**
+ * Convert MAC address bytes to string format (xx:xx:xx:xx:xx:xx)
+ */
+String macToString(const uint8_t* macArray) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+           macArray[0], macArray[1], macArray[2], macArray[3], macArray[4], macArray[5]);
+  return String(macStr);
+}
+
+/**
+ * Check if a given MAC address matches any known AP in our whitelist
+ */
+bool isKnownAP(String macAddress, String& knownAPName) {
+  for (int i = 0; i < NUM_KNOWN_APS; i++) {
+    if (macAddress.equalsIgnoreCase(String(knownAPs[i].macAddress))) {
+      knownAPName = String(knownAPs[i].name);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Scan for WiFi networks and find the closest known AP
+ * Filters results by MAC address whitelist and returns the strongest signal
+ */
+void findClosestKnownAP() {
+  Serial.println("\n========== WiFi SCAN ==========");
+  Serial.println("Scanning for available networks...");
+  
+  // Start WiFi scan (non-blocking)
+  int numNetworks = WiFi.scanNetworks();
+  
+  if (numNetworks == 0) {
+    Serial.println("No networks found.");
+    Serial.println("================================\n");
+    return;
+  }
+  
+  Serial.print("Found ");
+  Serial.print(numNetworks);
+  Serial.println(" networks total.");
+  
+  // Variables to track the closest known AP
+  int closestRSSI = -200;  // Start with worst possible signal
+  String closestMAC = "";
+  String closestSSID = "";
+  String closestName = "";
+  bool foundKnownAP = false;
+  
+  // Loop through scan results
+  Serial.println("\nProcessing scan results:");
+  for (int i = 0; i < numNetworks; i++) {
+    // Get network info
+    String ssid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    uint8_t* bssid = WiFi.BSSID(i);
+    String macAddress = macToString(bssid);
+    
+    // Check if this MAC is in our whitelist
+    String knownAPName;
+    if (isKnownAP(macAddress, knownAPName)) {
+      foundKnownAP = true;
+      Serial.print("  ✓ KNOWN: ");
+      Serial.print(knownAPName);
+      Serial.print(" (");
+      Serial.print(ssid);
+      Serial.print(") - MAC: ");
+      Serial.print(macAddress);
+      Serial.print(" - RSSI: ");
+      Serial.print(rssi);
+      Serial.println(" dBm");
+      
+      // Check if this is the strongest signal found so far
+      if (rssi > closestRSSI) {
+        closestRSSI = rssi;
+        closestMAC = macAddress;
+        closestSSID = ssid;
+        closestName = knownAPName;
+      }
+    } else {
+      // Unknown AP - ignore
+      Serial.print("  ✗ UNKNOWN: ");
+      Serial.print(ssid);
+      Serial.print(" (");
+      Serial.print(macAddress);
+      Serial.println(") - IGNORED");
+    }
+  }
+  
+  // Display results
+  Serial.println("\n--- SCAN RESULTS ---");
+  if (foundKnownAP) {
+    Serial.println("Closest Known Access Point:");
+    Serial.print("  Name: ");
+    Serial.println(closestName);
+    Serial.print("  SSID: ");
+    Serial.println(closestSSID);
+    Serial.print("  MAC Address: ");
+    Serial.println(closestMAC);
+    Serial.print("  Signal Strength (RSSI): ");
+    Serial.print(closestRSSI);
+    Serial.println(" dBm");
+  } else {
+    Serial.println("No known access points detected in scan.");
+  }
+  
+  Serial.println("================================\n");
+  
+  // Clean up scan results memory
+  WiFi.scanDelete();
 }
