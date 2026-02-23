@@ -14,9 +14,24 @@
 
 #include <Wire.h>
 #include <WiFi.h>
+#include <TFT_eSPI.h>
 #include "MAX30102Sensor.h"
 #include "HeartRateMonitor.h"
 #include "StepDetector.h"
+
+// ============= TFT DISPLAY SETUP =============
+TFT_eSPI tft = TFT_eSPI();
+
+// Pin definitions for GC9A01 (1.28" Round LCD)
+#define TFT_CS    15   // Chip Select (D15)
+#define TFT_RST    2   // Reset (D2)
+#define TFT_DC     4   // Data/Command (A0 - D4)
+#define TFT_MOSI  23   // SDA (D23)
+#define TFT_CLK   18   // SCK (D18)
+
+// Display dimensions
+#define DISPLAY_WIDTH  240
+#define DISPLAY_HEIGHT 240
 
 // ============= SENSOR INSTANCES =============
 MAX30102Sensor heartRateSensor;
@@ -92,6 +107,11 @@ void setup()
   Serial.println("\n=== All Sensors Ready ===\n");
   delay(2500);
 
+  // Initialize TFT Display
+  Serial.println("Initializing TFT Display...");
+  initializeDisplay();
+  Serial.println("✓ TFT Display initialized successfully\n");
+
   // Initialize WiFi in station mode (scan only, no connection)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();  // Turn off auto-connect
@@ -144,6 +164,7 @@ void loop()
   if ((displayCounter % SAMPLING) == 0) {
     if (millis() > TIMETOBOOT) {
       displayCombinedData();
+      updateTFTDisplay();  // Update TFT display
     }
     displayCounter = 0;
   }
@@ -256,6 +277,189 @@ void displaySimplifiedData()
   Serial.print(" | Accel: ");
   Serial.print(stepDetector.getAccelMagnitude());
   Serial.println(" m/s²");
+}
+
+// ============= TFT DISPLAY FUNCTIONS =============
+/**
+ * Initialize the TFT display (GC9A01 1.28" Round LCD)
+ */
+void initializeDisplay()
+{
+  // Configure SPI pins for ESP32
+  SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);  // SCK, MISO (unused), MOSI, CS
+  
+  // Initialize TFT_eSPI with custom pin configuration
+  tft.init();
+  
+  // Set rotation (0=normal, 1=90°, 2=180°, 3=270°)
+  tft.setRotation(0);
+  
+  // Clear screen with black background
+  tft.fillScreen(TFT_BLACK);
+  
+  // Display welcome screen
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(55, 100);
+  tft.println("CuraWatch");
+  
+  tft.setTextSize(1);
+  tft.setCursor(55, 125);
+  tft.println("Initializing...");
+  
+  delay(1500);
+  tft.fillScreen(TFT_BLACK);
+}
+
+/**
+ * Update the TFT display with current HR, SpO2, and Steps
+ */
+void updateTFTDisplay()
+{
+  // Only update if finger is detected
+  if (!heartRateSensor.isFingerDetected()) {
+    displayNoFingerScreen();
+    return;
+  }
+
+  // Clear screen
+  tft.fillScreen(TFT_BLACK);
+  
+  // Get current sensor values
+  int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 0;
+  float spo2 = heartRateSensor.getFilteredSpO2();
+  int steps = stepDetector.getStepCount();
+  
+  // Define colors
+  uint16_t hrColor = getHRColor(hr);
+  uint16_t spo2Color = getSPO2Color(spo2);
+  uint16_t stepColor = TFT_CYAN;
+  
+  // Draw three metric boxes in a triangular arrangement
+  // Top center: Heart Rate
+  drawMetricBox(120, 20, "HR", String(hr), "bpm", hrColor, 35);
+  
+  // Bottom left: SpO2
+  drawMetricBox(40, 140, "SpO2", String((int)spo2), "%", spo2Color, 30);
+  
+  // Bottom right: Steps
+  drawMetricBox(200, 140, "STEPS", String(steps), "", stepColor, 30);
+  
+  // Draw status indicators at bottom
+  drawStatusBar();
+}
+
+/**
+ * Draw a metric box on the display
+ * x, y: position (top-left corner)
+ * label: metric name
+ * value: metric value
+ * unit: unit of measurement
+ * color: color for the box
+ * fontSize: font size multiplier
+ */
+void drawMetricBox(int x, int y, const char* label, String value, const char* unit, uint16_t color, int fontSize)
+{
+  int boxWidth = 60;
+  int boxHeight = 50;
+  
+  // Draw rounded rectangle border
+  tft.drawRoundRect(x - boxWidth/2, y, boxWidth, boxHeight, 5, color);
+  
+  // Draw filled rectangle for label background
+  tft.fillRect(x - boxWidth/2 + 2, y + 2, boxWidth - 4, 15, color);
+  
+  // Draw label
+  tft.setTextColor(TFT_BLACK, color);
+  tft.setTextSize(1);
+  int labelWidth = strlen(label) * 6;
+  tft.setCursor(x - labelWidth/2, y + 5);
+  tft.print(label);
+  
+  // Draw value
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setTextSize(2);
+  int valueWidth = value.length() * 12;
+  tft.setCursor(x - valueWidth/2, y + 20);
+  tft.print(value);
+  
+  // Draw unit
+  if (strlen(unit) > 0) {
+    tft.setTextSize(1);
+    int unitWidth = strlen(unit) * 6;
+    tft.setCursor(x - unitWidth/2, y + 35);
+    tft.print(unit);
+  }
+}
+
+/**
+ * Get color for heart rate based on value
+ */
+uint16_t getHRColor(int hr)
+{
+  if (hr == 0) return TFT_DARKGREY;     // No signal
+  if (hr < 60) return TFT_BLUE;         // Low (bradycardia)
+  if (hr <= 100) return TFT_GREEN;      // Normal
+  if (hr <= 120) return TFT_YELLOW;     // Elevated
+  return TFT_RED;                       // High (tachycardia)
+}
+
+/**
+ * Get color for SpO2 based on value
+ */
+uint16_t getSPO2Color(float spo2)
+{
+  if (spo2 == 0) return TFT_DARKGREY;   // No signal
+  if (spo2 >= 95) return TFT_GREEN;     // Normal
+  if (spo2 >= 90) return TFT_YELLOW;    // Acceptable
+  if (spo2 >= 85) return TFT_ORANGE;    // Low
+  return TFT_RED;                       // Critical
+}
+
+/**
+ * Display "No Finger Detected" screen
+ */
+void displayNoFingerScreen()
+{
+  static unsigned long lastNoFingerTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Update screen only if it hasn't been updated recently
+  if (currentTime - lastNoFingerTime > 500) {
+    tft.fillScreen(TFT_BLACK);
+    
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(2);
+    
+    int textWidth = 8 * 12;  // Approximate width of "No Finger"
+    tft.setCursor(120 - textWidth/2, 105);
+    tft.print("No Finger");
+    
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    textWidth = 13 * 6;  // Approximate width of "Place on sensor"
+    tft.setCursor(120 - textWidth/2, 125);
+    tft.print("Place on sensor");
+    
+    lastNoFingerTime = currentTime;
+  }
+}
+
+/**
+ * Draw status bar at the bottom
+ */
+void drawStatusBar()
+{
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  
+  // Draw a separator line
+  tft.drawLine(10, 215, 230, 215, TFT_DARKGREY);
+  
+  // Display sensor status
+  String statusText = "Sensor: OK";
+  tft.setCursor(15, 220);
+  tft.print(statusText);
 }
 
 // ============= WiFi SCANNING FUNCTIONS =============
