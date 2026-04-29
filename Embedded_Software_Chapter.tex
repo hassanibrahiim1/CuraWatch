@@ -1,0 +1,746 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+
+\geometry{margin=1in}
+\onehalfspacing
+
+\lstdefinestyle{codestyle}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{gray!10},
+  frame=single,
+  rulecolor=\color{gray!50},
+  framesep=6pt,
+  aboveskip=1em,
+  belowskip=1em,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=8pt,
+  tabsize=2,
+  captionpos=b
+}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+{\Large University Name Placeholder\par}
+\vspace{1.5cm}
+{\LARGE Graduation Project Report\par}
+\vspace{0.8cm}
+{\Huge \textbf{Embedded Software Documentation}\par}
+\vspace{0.4cm}
+{\Large CuraWatch System (ESP32 Firmware)\par}
+\vspace{2cm}
+
+\begin{flushleft}
+\textbf{Student Name(s):} Placeholder \\
+\textbf{Supervisor(s):} Placeholder \\
+\textbf{Department:} Placeholder \\
+\textbf{Academic Year:} 2025--2026
+\end{flushleft}
+
+\vfill
+{\large Date: \today\par}
+\end{titlepage}
+
+\begin{abstract}
+This chapter documents the embedded software implementation of the CuraWatch project based strictly on the source code and files available in the current repository folder. The firmware targets an ESP32 platform and integrates physiological and motion sensing, local display rendering, wireless connectivity, authentication, and periodic backend data transmission.
+
+The software architecture follows a modular class-based design around four primary components: MAX30102 acquisition and SpO2 estimation, heart-rate beat processing, motion-based step detection, and authentication/network communication. The runtime is implemented as a cooperative superloop with non-blocking time-based scheduling for periodic tasks. Sensor values are continuously acquired, filtered or validated, visualized on a TFT display, and conditionally transmitted to backend APIs.
+
+The chapter focuses on implementation details including boot sequence, data flow, module responsibilities, error handling, fallback behavior, and integration points that are explicitly present in the repository. Hardware and sensor theory are intentionally minimized because they are covered in the project book.
+\end{abstract}
+
+\tableofcontents
+\clearpage
+
+\chapter{Embedded Software Chapter}
+
+\section{Introduction}
+The CuraWatch embedded firmware is implemented primarily in \texttt{CuraWatch\_Combined.ino} with supporting C++ modules:
+\texttt{MAX30102Sensor.*}, \texttt{HeartRateMonitor.*}, \texttt{StepDetector.*}, and \texttt{AuthenticationManager.*}.
+The implementation targets ESP32 and combines sensing, local user feedback (TFT display), and cloud/backend communication in a single runtime image.
+
+This chapter documents:
+\begin{itemize}
+  \item software architecture and module boundaries;
+  \item initialization and runtime control flow;
+  \item data acquisition, filtering, and validation logic;
+  \item communication with backend services;
+  \item fault handling and current implementation limitations.
+\end{itemize}
+
+\section{Project Software Overview}
+\subsection{Scope of the Embedded Software}
+Based on the source files in this folder, the embedded software responsibilities are:
+\begin{itemize}
+  \item acquire sensor streams from MAX30102, MPU6050, and DS18B20;
+  \item process heart rate, SpO2, motion, and temperature values;
+  \item present real-time metrics on a GC9A01 TFT display;
+  \item maintain Wi-Fi connectivity and perform network scans;
+  \item authenticate with backend APIs and send periodic vital records;
+  \item persist credentials and token data in non-volatile storage.
+\end{itemize}
+
+\subsection{Repository Evidence Used}
+The analysis was derived from these implementation files:
+\begin{itemize}
+  \item \texttt{CuraWatch\_Combined.ino}
+  \item \texttt{MAX30102Sensor.h/.cpp}
+  \item \texttt{HeartRateMonitor.h/.cpp}
+  \item \texttt{StepDetector.h/.cpp}
+  \item \texttt{AuthenticationManager.h/.cpp}
+  \item \texttt{User\_Setup.h}
+  \item \texttt{backend/Cura Watch.postman\_collection.json}
+\end{itemize}
+
+\section{System Architecture}
+\subsection{Architectural Style}
+The firmware follows a layered, module-oriented embedded architecture:
+\begin{enumerate}
+  \item \textbf{Hardware Abstraction Layer}: external libraries for I2C, OneWire, Wi-Fi, HTTP, display, and sensor drivers.
+  \item \textbf{Service Modules}: classes encapsulating domain logic (heart rate, SpO2, steps, auth).
+  \item \textbf{Application Layer}: superloop orchestration, scheduling, UI updates, and backend reporting.
+\end{enumerate}
+
+% TODO: Replace with actual architecture diagram exported from your design tool.
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.85\linewidth}{\centering Placeholder for figure: firmware architecture diagram}}
+\caption{Firmware architecture}
+\label{fig:firmware-architecture}
+\end{figure}
+
+\subsection{Main File and Module Responsibilities}
+\begin{longtable}{p{0.29\linewidth} p{0.67\linewidth}}
+\toprule
+\textbf{File} & \textbf{Software Responsibility} \\
+\midrule
+\endhead
+\texttt{CuraWatch\_Combined.ino} & System entry point, setup/loop orchestration, scheduling, display rendering, Wi-Fi scanning/connection, auth workflow calls, and periodic backend upload trigger. \\
+\texttt{MAX30102Sensor.cpp} & MAX30102 initialization, FIFO sample read, moving-average style signal smoothing, RMS-based SpO2 estimation, and finger-detection gate. \\
+\texttt{HeartRateMonitor.cpp} & Beat detection integration (\texttt{checkForBeat}), BPM calculation from inter-beat interval, rolling average over 8 samples, and validity gating. \\
+\texttt{StepDetector.cpp} & MPU6050 initialization, acceleration/orientation/gyro computation, and threshold-hysteresis step counting. \\
+\texttt{AuthenticationManager.cpp} & Credentials/token persistence via \texttt{Preferences}, login/auto-login flow, JWT header construction, JSON payload construction, and vitals HTTP POST. \\
+\texttt{User\_Setup.h} & TFT\_eSPI hardware configuration for GC9A01 (driver selection, pins, SPI frequency, font and rendering options). \\
+\texttt{backend/Cura Watch.postman\_collection.json} & API contract reference used during integration testing; includes \texttt{/api/v1/auth/login} and \texttt{/api/v1/patients/vitals}. \\
+\bottomrule
+\end{longtable}
+
+\section{Firmware Design and Module Breakdown}
+\subsection{Core Objects and Their Interaction}
+In global scope, the firmware instantiates:
+\begin{itemize}
+  \item \texttt{MAX30102Sensor heartRateSensor}
+  \item \texttt{HeartRateMonitor hrMonitor}
+  \item \texttt{StepDetector stepDetector}
+  \item \texttt{AuthenticationManager authManager}
+  \item \texttt{DallasTemperature tempSensor}
+  \item \texttt{TFT\_eSPI tft}
+\end{itemize}
+
+At runtime, \texttt{heartRateSensor} feeds both SpO2 and beat data pathways, \texttt{hrMonitor} computes stable HR values, \texttt{stepDetector} updates locomotion metrics, and \texttt{authManager} packages and transmits vital snapshots.
+
+% TODO: Replace with actual class interaction/UML diagram.
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.85\linewidth}{\centering Placeholder for figure: module interaction diagram (MAX30102Sensor, HeartRateMonitor, StepDetector, AuthenticationManager)}}
+\caption{Main firmware module interactions}
+\label{fig:module-interactions}
+\end{figure}
+
+\subsection{Initialization Flow (\texttt{setup()})}
+The initialization sequence implemented in \texttt{setup()} is:
+\begin{enumerate}
+  \item Start serial logging at 115200 baud and enable debug output.
+  \item Run \texttt{testPreferences()} and \texttt{authManager.debugPreferencesState()}.
+  \item Initialize shared I2C bus with \texttt{Wire.begin()}.
+  \item Initialize MAX30102 with retry loop (up to 5 attempts).
+  \item Initialize MPU6050 through \texttt{stepDetector.initialize()}.
+  \item Initialize DS18B20 and attempt first temperature acquisition.
+  \item Initialize TFT display and show startup status.
+  \item Enter Wi-Fi station mode and print known AP whitelist.
+  \item Save credentials using \texttt{saveNewCredentials(...)} (currently active in code).
+  \item Connect Wi-Fi, configure NTP time sync, verify epoch sanity.
+  \item Run \texttt{testSensorsAndPayload()} to print sample payload.
+\end{enumerate}
+
+The following excerpt shows the actual boot orchestration in firmware, including diagnostics, bus startup, and sensor initialization attempts.
+\begin{lstlisting}[style=codestyle, language=C++]
+void setup()
+{
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  delay(1000);
+
+  testPreferences();
+  authManager.debugPreferencesState();
+
+  Wire.begin();
+  delay(500);
+
+  int maxAttempts = 5;
+  while (!heartRateSensor.begin() && maxAttempts-- > 0) {
+    Serial.println("  MAX30102 not found. Retrying...");
+    delay(1000);
+  }
+
+  if (!stepDetector.initialize()) {
+    Serial.println("ERROR: MPU6050 failed to initialize!");
+  }
+}
+\end{lstlisting}
+
+\subsection{Scheduling Model in \texttt{loop()}}
+The firmware uses cooperative time checks (no RTOS tasks shown in this folder). The main periodic controls are:
+\begin{itemize}
+  \item \texttt{UPDATE\_INTERVAL = 200 ms}: MPU6050 update.
+  \item \texttt{WiFi\_SCAN\_INTERVAL = 5000 ms}: access-point scan/report.
+  \item \texttt{VITALS\_SEND\_INTERVAL = 60000 ms}: backend push/autologin.
+  \item \texttt{SAMPLING = 100} with MAX30102 sample counter: display/serial refresh trigger.
+\end{itemize}
+
+The MAX30102 acquisition path is continuously polled in FIFO mode inside the loop, while all other periodic work is executed by elapsed-time checks using \texttt{millis()}.
+
+The runtime scheduler is implemented directly in the main loop using periodic elapsed-time checks and independent task intervals.
+\begin{lstlisting}[style=codestyle, language=C++]
+void loop()
+{
+  #ifdef USEFIFO
+  heartRateSensor.check();
+
+  while (heartRateSensor.hasData()) {
+    uint32_t red, ir;
+    heartRateSensor.readSensor(red, ir);
+    sampleCounter++;
+    displayCounter++;
+    heartRateSensor.updateSpO2(red, ir);
+    hrMonitor.detectBeat(ir);
+  }
+  #endif
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastUpdateTime >= UPDATE_INTERVAL) {
+    stepDetector.update();
+    lastUpdateTime = currentTime;
+  }
+
+  if (millis() - lastWiFiScanTime >= WiFi_SCAN_INTERVAL) {
+    findClosestKnownAP();
+    lastWiFiScanTime = millis();
+  }
+
+  if (currentTime - lastVitalsSentTime >= VITALS_SEND_INTERVAL) {
+    if (authManager.isAuthenticated()) sendVitalsToBackend();
+    else attemptAutoLogin();
+    lastVitalsSentTime = currentTime;
+  }
+}
+\end{lstlisting}
+
+\section{Data Acquisition and Processing}
+\subsection{MAX30102 Sampling and SpO2 Estimation}
+The MAX30102 module configures:
+\begin{itemize}
+  \item sample rate: 200 Hz,
+  \item pulse width: 411,
+  \item LED mode: red + IR,
+  \item ADC range: 16384.
+\end{itemize}
+
+The sensor read path explicitly accounts for board-level channel mapping differences before samples are consumed by the processing pipeline.
+\begin{lstlisting}[style=codestyle, language=C++]
+void MAX30102Sensor::readSensor(uint32_t &red, uint32_t &ir) {
+  // Note: MH-ET LIVE MAX30102 board has swapped outputs
+  red = particleSensor.getFIFOIR();
+  ir = particleSensor.getFIFORed();
+  particleSensor.nextSample();
+}
+\end{lstlisting}
+
+Implementation details present in code:
+\begin{itemize}
+  \item Board-specific channel swap is handled in \texttt{readSensor()} (IR and Red FIFO mapping inverted).
+  \item Exponential-style averaging:
+  \[
+  \texttt{avered} \leftarrow \texttt{avered}\cdot \texttt{frate} + \texttt{red}\cdot(1-\texttt{frate})
+  \]
+  \[
+  \texttt{aveir} \leftarrow \texttt{aveir}\cdot \texttt{frate} + \texttt{ir}\cdot(1-\texttt{frate})
+  \]
+  with \texttt{frate = 0.95}.
+  \item RMS accumulation over \texttt{NUM\_SAMPLES = 100}, then ratio-based SpO2 estimate:
+  \[
+  SpO_2 = -23.3\cdot(R - 0.4) + 100
+  \]
+  \item Final SpO2 smoothing:
+  \[
+  ESpO_2 \leftarrow FSpO_2\cdot ESpO_2 + (1-FSpO_2)\cdot lastSpO_2,\quad FSpO_2=0.7
+  \]
+  \item Finger detection gate based on averaged IR threshold (\texttt{aveir > 30000}).
+\end{itemize}
+
+The filtering and SpO2 update are implemented over fixed windows and then smoothed with a low-pass blending factor.
+\begin{lstlisting}[style=codestyle, language=C++]
+void MAX30102Sensor::updateSpO2(double red, double ir) {
+  double fred = (double)red;
+  double fir = (double)ir;
+  updateAverages(fred, fir);
+
+  if (sampleCount >= NUM_SAMPLES) {
+    lastSpO2 = calculateSpO2(sqrt(sumredrms) / avered, sqrt(sumirrms) / aveir);
+    ESpO2 = FSpO2 * ESpO2 + (1.0 - FSpO2) * lastSpO2;
+    sumredrms = 0.0;
+    sumirrms = 0.0;
+    sampleCount = 0;
+  }
+}
+\end{lstlisting}
+
+\subsection{Heart-Rate Processing}
+\texttt{HeartRateMonitor} uses \texttt{checkForBeat(ir)} and validates each candidate beat using:
+\begin{itemize}
+  \item minimum inter-beat interval: \texttt{MIN\_DELTA = 300 ms},
+  \item valid BPM range: 40 to 180 bpm.
+\end{itemize}
+
+BPM values are stored in an 8-sample ring buffer; average HR is marked valid only after at least 3 non-zero readings. When finger contact is lost, \texttt{reset()} clears the HR state.
+
+The beat-detection routine rejects invalid timing and rate outliers before inserting values into the rolling average buffer.
+\begin{lstlisting}[style=codestyle, language=C++]
+void HeartRateMonitor::detectBeat(uint32_t ir) {
+  if (ir < FINGER_ON) return;
+
+  if (checkForBeat(ir) == true) {
+    long delta = millis() - lastBeat;
+    if (delta > MIN_DELTA) {
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < MAX_HR && beatsPerMinute > MIN_HR) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        calculateAverage();
+      }
+    }
+  }
+}
+\end{lstlisting}
+
+\subsection{Motion Processing and Step Detection}
+The \texttt{StepDetector} module:
+\begin{itemize}
+  \item acquires accel/gyro events via Adafruit MPU6050 driver;
+  \item computes acceleration magnitude, pitch, roll, and gyroscope magnitude;
+  \item increments steps using threshold hysteresis:
+  \begin{itemize}
+    \item rising threshold: \texttt{ACCEL\_THRESHOLD\_HIGH = 12.0}
+    \item release threshold: \texttt{ACCEL\_THRESHOLD\_LOW = 10.0}
+  \end{itemize}
+\end{itemize}
+
+This high/low scheme suppresses repeated counts while acceleration stays above threshold.
+
+The implementation updates all motion features and then applies threshold-hysteresis logic to avoid multiple counts per step impulse.
+\begin{lstlisting}[style=codestyle, language=C++]
+void StepDetector::update() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  calculateAccelerometerMagnitude(a);
+  calculateOrientation(a);
+  calculateGyroMagnitude(g);
+  detectSteps();
+}
+
+void StepDetector::detectSteps() {
+  if (accelMagnitude > ACCEL_THRESHOLD_HIGH && !stepDetected) {
+    stepDetected = true;
+    stepCount++;
+  }
+
+  if (accelMagnitude < ACCEL_THRESHOLD_LOW) {
+    stepDetected = false;
+  }
+}
+\end{lstlisting}
+
+\subsection{Temperature Acquisition and Validation}
+Temperature is read from DS18B20 via OneWire/DallasTemperature. Validation logic is present in runtime send path:
+\begin{itemize}
+  \item disconnected value (\texttt{-127}) triggers fallback to \(36.6^\circ C\);
+  \item out-of-range values (\(<20^\circ C\) or \(>45^\circ C\)) are clamped to \(36.6^\circ C\).
+\end{itemize}
+
+The JSON payload uses Celsius temperature; MAX30102 internal temperature is read in Fahrenheit for local serial display.
+
+The runtime send path validates DS18B20 output and applies fallback values before transmission.
+\begin{lstlisting}[style=codestyle, language=C++]
+tempSensor.requestTemperatures();
+delay(100);
+float temperature = tempSensor.getTempCByIndex(0);
+
+if (temperature == DEVICE_DISCONNECTED_C) {
+  Serial.println("Temperature sensor disconnected, using default value");
+  temperature = 36.6;
+} else if (temperature < 20 || temperature > 45) {
+  Serial.print("Invalid temperature reading: ");
+  Serial.println(temperature);
+  temperature = 36.6;
+}
+\end{lstlisting}
+
+\section{Communication and Integration}
+\subsection{Wi-Fi Discovery and Connection Strategy}
+The code defines a whitelist of known access points (\texttt{KnownAP} array with name, MAC, and password). The device:
+\begin{enumerate}
+  \item scans nearby APs;
+  \item filters by known MAC addresses;
+  \item selects the strongest RSSI;
+  \item attempts connection with the corresponding password.
+\end{enumerate}
+
+If no known AP is found, backend communication is skipped until connectivity is restored.
+
+The connection function scans available networks, filters by known MAC addresses, and connects to the strongest whitelisted AP.
+\begin{lstlisting}[style=codestyle, language=C++]
+void connectToWiFi() {
+  int numNetworks = WiFi.scanNetworks();
+  if (numNetworks == 0) return;
+
+  int closestRSSI = -200;
+  String closestSSID = "";
+  String closestPassword = "";
+
+  for (int i = 0; i < numNetworks; i++) {
+    String ssid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    uint8_t* bssid = WiFi.BSSID(i);
+    String macAddress = macToString(bssid);
+
+    String knownAPName;
+    if (isKnownAP(macAddress, knownAPName)) {
+      for (int j = 0; j < NUM_KNOWN_APS; j++) {
+        if (macAddress.equalsIgnoreCase(String(knownAPs[j].macAddress))) {
+          if (rssi > closestRSSI) {
+            closestRSSI = rssi;
+            closestSSID = ssid;
+            closestPassword = String(knownAPs[j].password);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (!closestSSID.isEmpty()) {
+    WiFi.begin(closestSSID.c_str(), closestPassword.c_str());
+  }
+}
+\end{lstlisting}
+
+\subsection{Backend Authentication and Token Workflow}
+\texttt{AuthenticationManager} implements:
+\begin{itemize}
+  \item credential persistence in ESP32 \texttt{Preferences} namespace (\texttt{"cura"});
+  \item login request to \texttt{/api/v1/auth/login};
+  \item token extraction using ArduinoJson;
+  \item Bearer token header generation;
+  \item token age check with local TTL (\(24\) hours based on \texttt{millis()}).
+\end{itemize}
+
+Runtime behavior:
+\begin{itemize}
+  \item if unauthenticated during periodic send, \texttt{attemptAutoLogin()} is called;
+  \item auto-login first uses stored credentials, then falls back to configured constants;
+  \item on HTTP 401/not-authenticated style errors, re-login is triggered before next send.
+\end{itemize}
+
+Authentication requests are sent as JSON over HTTP, and successful responses persist both credentials and token.
+\begin{lstlisting}[style=codestyle, language=C++]
+bool AuthenticationManager::login(const char* email, const char* password,
+                                  const char* backendURL) {
+  String loginURL = String(backendURL) + "/api/v1/auth/login";
+  HTTPClient http;
+  http.begin(loginURL);
+  http.setTimeout(10000);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{\"email\":\"" + String(email) +
+                   "\",\"password\":\"" + String(password) + "\"}";
+  int httpResponseCode = http.POST(payload);
+  if (httpResponseCode != 200) {
+    lastError = "HTTP " + String(httpResponseCode);
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+  String token, userId, fullName;
+  if (!parseLoginResponse(response, token, userId, fullName)) return false;
+
+  saveCredentials(email, password);
+  saveToken(token.c_str());
+  return true;
+}
+\end{lstlisting}
+
+\subsection{Vitals Payload and API Submission}
+Vitals are posted to \texttt{/api/v1/patients/vitals} with fields:
+\begin{itemize}
+  \item \texttt{heart\_rate}
+  \item \texttt{oxygen} (rounded)
+  \item \texttt{steps}
+  \item \texttt{temperature}
+  \item \texttt{reading\_date} (ISO timestamp)
+\end{itemize}
+
+Example payload format reflected in \texttt{buildVitalsJSON()}:
+\texttt{buildVitalsJSON()} constructs the payload and enforces bounds before serialization and POST.
+\begin{lstlisting}[style=codestyle, language=C++]
+String AuthenticationManager::buildVitalsJSON(int heartRate, float spo2, int steps,
+                                              float temperature) const {
+  if (spo2 < 0) spo2 = 0;
+  if (spo2 > 100) spo2 = 100;
+  if (temperature < 20 || temperature > 45) temperature = 36.6;
+
+  DynamicJsonDocument doc(512);
+  doc["heart_rate"] = heartRate;
+  doc["oxygen"] = round(spo2);
+  doc["steps"] = steps;
+  doc["temperature"] = temperature;
+
+  char isoTime[25];
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+  doc["reading_date"] = isoTime;
+
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=codestyle, language=C++,caption={Vitals JSON payload format generated in firmware}]
+{
+  "heart_rate": 72,
+  "oxygen": 98,
+  "steps": 1200,
+  "temperature": 36.6,
+  "reading_date": "2026-04-15T19:20:00Z"
+}
+\end{lstlisting}
+
+% ASSUMPTION: The image below appears to be an integration screenshot artifact; verify exact content before final submission.
+% TODO: Replace with actual screenshot from backend/photo_2026-04-15_19-18-56.jpg if relevant.
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.85\linewidth}{\centering Placeholder for figure: backend integration screenshot or Postman result}}
+\caption{Backend integration evidence placeholder}
+\label{fig:backend-integration}
+\end{figure}
+
+\subsection{Available Integration Artifacts in Repository}
+The current folder includes:
+\begin{itemize}
+  \item \texttt{backend/Cura Watch.postman\_collection.json}: API endpoint and request examples.
+  \item \texttt{backend/photo\_2026-04-15\_19-18-56.jpg}: image artifact that can be used as report evidence after visual verification.
+\end{itemize}
+
+Backend server-side source code and mobile application source code are not present in this folder; therefore, only firmware-side integration behavior is documented here.
+
+\section{Runtime Flow / State Machine / Task Flow}
+\subsection{Boot-to-Runtime Workflow}
+The system behavior from power-up to steady operation can be summarized as:
+\begin{enumerate}
+  \item Boot and diagnostics (\texttt{Serial}, preferences checks, sensor init).
+  \item Connectivity and time base setup (Wi-Fi and NTP).
+  \item Enter superloop:
+  \begin{itemize}
+    \item continuous MAX30102 FIFO draining and signal updates;
+    \item 200 ms motion update;
+    \item periodic serial+TFT refresh after sampling gate;
+    \item 5 s Wi-Fi scan report;
+    \item 60 s backend upload attempt.
+  \end{itemize}
+\end{enumerate}
+
+The setup tail performs connectivity establishment, NTP synchronization, and startup payload verification before entering steady-state execution.
+\begin{lstlisting}[style=codestyle, language=C++]
+connectToWiFi();
+
+configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+delay(5000);
+
+time_t now = time(nullptr);
+if (now <= 1609459200) {
+  delay(30000);
+  configTime(3 * 3600, 0, "0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org");
+  delay(5000);
+}
+
+testSensorsAndPayload();
+\end{lstlisting}
+
+% TODO: Replace with actual flowchart from draw.io/Lucidchart.
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.85\linewidth}{\centering Placeholder for figure: boot-to-runtime firmware flowchart}}
+\caption{System workflow from boot to runtime}
+\label{fig:boot-runtime-flow}
+\end{figure}
+
+\subsection{Operational States (Software View)}
+Although no explicit enum-based state machine is implemented, behavior maps to implicit states:
+\begin{itemize}
+  \item \textbf{Initialization}: hardware and connectivity setup.
+  \item \textbf{Sensing}: continuous sensor acquisition and local processing.
+  \item \textbf{Display Update}: periodic UI rendering and no-finger handling.
+  \item \textbf{Connectivity Maintenance}: scan/reconnect activities.
+  \item \textbf{Authenticated Upload}: periodic JSON posting to backend.
+  \item \textbf{Recovery}: re-authentication or fallback-value operation.
+\end{itemize}
+
+% TODO: Replace with actual task timing diagram if available.
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.85\linewidth}{\centering Placeholder for figure: cooperative task timing diagram (millis-based scheduling)}}
+\caption{Task scheduling timeline}
+\label{fig:task-timeline}
+\end{figure}
+
+\section{Testing and Debugging Notes}
+\subsection{Evidence of In-Code Diagnostics}
+The firmware includes explicit debug support:
+\begin{itemize}
+  \item serial startup banners and sensor initialization logs;
+  \item \texttt{testPreferences()} to verify non-volatile storage behavior;
+  \item \texttt{authManager.debugPreferencesState()} for key inspection;
+  \item \texttt{testSensorsAndPayload()} for one-shot payload verification;
+  \item detailed authentication HTTP response code logging.
+\end{itemize}
+
+The firmware includes an explicit non-volatile storage self-check routine to confirm persistence behavior during startup.
+\begin{lstlisting}[style=codestyle, language=C++]
+void testPreferences() {
+  Preferences testPrefs;
+  if (!testPrefs.begin("test_namespace", false)) {
+    Serial.println("Failed to initialize test preferences");
+    return;
+  }
+
+  String persistentValue = testPrefs.getString("persistent_test", "");
+  String newValue = "run_at_" + String(millis());
+  testPrefs.putString("persistent_test", newValue);
+
+  String testValue = testPrefs.getString("persistent_test", "");
+  if (testValue == newValue) {
+    Serial.println("Immediate read-back successful");
+  }
+
+  testPrefs.end();
+}
+\end{lstlisting}
+
+\subsection{Error Handling and Fallback Behavior}
+Observed error-handling patterns include:
+\begin{itemize}
+  \item retry loop for MAX30102 startup;
+  \item graceful continuation if MPU6050/DS18B20 initialization fails;
+  \item default temperature fallback when sensor is disconnected or invalid;
+  \item no-finger UI and HR reset when optical signal quality is low;
+  \item skip-send and reconnection attempt if Wi-Fi is down;
+  \item re-login path on authentication failure.
+\end{itemize}
+
+The vitals-send path demonstrates layered fallback: sensor validation, connectivity check, send attempt, then authentication recovery.
+\begin{lstlisting}[style=codestyle, language=C++]
+if (temperature == DEVICE_DISCONNECTED_C) {
+  temperature = 36.6;
+} else if (temperature < 20 || temperature > 45) {
+  temperature = 36.6;
+}
+
+if (WiFi.status() != WL_CONNECTED) {
+  connectToWiFi();
+  return;
+}
+
+if (!authManager.sendVitals(BACKEND_URL, hr, spo2, steps, temperature)) {
+  if (authManager.getLastError().indexOf("401") >= 0 ||
+      authManager.getLastError().indexOf("Not authenticated") >= 0) {
+    attemptAutoLogin();
+  }
+}
+\end{lstlisting}
+
+\subsection{Current Gaps Visible in This Folder}
+The following are not present in the available repository scope:
+\begin{itemize}
+  \item automated unit tests or integration test scripts for firmware logic;
+  \item CI pipeline for compile/test validation;
+  \item explicit encrypted credential storage (credentials are persisted in plain text in Preferences);
+  \item backend implementation source for full end-to-end verification.
+\end{itemize}
+
+These items can be expanded in the final report after reviewing additional repositories or the deployment environment.
+
+\section{Conclusion}
+The embedded software in this repository demonstrates a complete firmware integration path for sensing, local visualization, connectivity, authentication, and cloud data upload on ESP32. The architecture is modular and readable, with practical fallbacks and diagnostic hooks that support field debugging.
+
+From a software engineering perspective, the implementation successfully connects raw sensor data acquisition to backend-ready health telemetry using class-based encapsulation and cooperative scheduling, while keeping runtime behavior deterministic and maintainable.
+
+\section{Future Improvements}
+Based on the current implementation details, the most relevant next enhancements are:
+\begin{enumerate}
+  \item migrate hardcoded credentials/AP passwords to a provisioning workflow;
+  \item secure stored credentials (encrypted storage and/or token-only persistence);
+  \item replace implicit superloop states with explicit finite-state definitions;
+  \item add local buffering/retry queue for vitals during network outages;
+  \item add automated tests for payload formatting and algorithm edge cases;
+  \item formalize calibration/tuning parameters in external configuration headers.
+\end{enumerate}
+
+\section*{References}
+\addcontentsline{toc}{section}{References}
+\begin{thebibliography}{99}
+\bibitem{repo-main}
+CuraWatch Repository Files (local project sources): \texttt{CuraWatch\_Combined.ino}, \texttt{MAX30102Sensor.*}, \texttt{HeartRateMonitor.*}, \texttt{StepDetector.*}, \texttt{AuthenticationManager.*}, accessed from project folder.
+
+\bibitem{repo-display}
+Display and integration notes (local project documentation): \texttt{User\_Setup.h}, \texttt{TFT\_DISPLAY\_SETUP.md}, \texttt{QUICK\_START.md}, \texttt{WIRING\_DIAGRAM.md}.
+
+\bibitem{repo-api}
+Backend API integration artifacts (local project folder): \texttt{backend/Cura Watch.postman\_collection.json}, \texttt{backend/photo\_2026-04-15\_19-18-56.jpg}.
+
+\bibitem{lib-max}
+MAX30102-related library usage via \texttt{MAX30105} and heart-rate detection helper \texttt{heartRate.h} as referenced in source includes.
+
+\bibitem{lib-adafruit}
+Adafruit sensor stack used in firmware: \texttt{Adafruit\_MPU6050}, \texttt{Adafruit\_Sensor}, plus core Arduino/ESP32 libraries (\texttt{Wire}, \texttt{WiFi}, \texttt{HTTPClient}, \texttt{ArduinoJson}, \texttt{Preferences}, \texttt{OneWire}, \texttt{DallasTemperature}, \texttt{TFT\_eSPI}).
+\end{thebibliography}
+
+\end{document}
+
+
+
+

@@ -15,9 +15,15 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <TFT_eSPI.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <time.h>
 #include "MAX30102Sensor.h"
 #include "HeartRateMonitor.h"
 #include "StepDetector.h"
+#include "AuthenticationManager.h"
 
 // ============= TFT DISPLAY SETUP =============
 TFT_eSPI tft = TFT_eSPI();
@@ -38,6 +44,61 @@ MAX30102Sensor heartRateSensor;
 HeartRateMonitor hrMonitor;
 StepDetector stepDetector;
 
+// ============= DS18B20 TEMPERATURE SENSOR =============
+#define ONE_WIRE_BUS 5  // Connect DS18B20 data pin to GPIO 5 (D5) - FIXED PIN CONFLICT
+#define DEVICE_DISCONNECTED_C -127  // DS18B20 disconnected value
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+
+// ============= AUTHENTICATION & BACKEND =============
+AuthenticationManager authManager;
+
+// Test preferences persistence
+void testPreferences() {
+  Serial.println("\n========== PREFERENCES TEST ==========");
+  
+  Preferences testPrefs;
+  if (!testPrefs.begin("test_namespace", false)) {
+    Serial.println("✗ Failed to initialize test preferences");
+    return;
+  }
+  
+  // Check for persistent value from previous run
+  String persistentValue = testPrefs.getString("persistent_test", "");
+  if (!persistentValue.isEmpty()) {
+    Serial.print("✓ Found persistent value from previous run: ");
+    Serial.println(persistentValue);
+  } else {
+    Serial.println("No persistent value found (first run or cleared)");
+  }
+  
+  // Save a new persistent value with timestamp
+  String newValue = "run_at_" + String(millis());
+  testPrefs.putString("persistent_test", newValue);
+  Serial.print("✓ Saved new persistent value: ");
+  Serial.println(newValue);
+  
+  // Test immediate read-back
+  String testValue = testPrefs.getString("persistent_test", "");
+  if (testValue == newValue) {
+    Serial.println("✓ Immediate read-back successful");
+  } else {
+    Serial.println("✗ Immediate read-back failed!");
+  }
+  
+  testPrefs.end();
+  Serial.println("========== END PREFERENCES TEST ==========\n");
+}
+
+// Backend configuration
+#define BACKEND_URL "https://cura-watch.onrender.com"  // TODO: Change to your backend server IP/address
+#define PATIENT_EMAIL "mustafa.ahmed.00878@gmail.com"     // TODO: Change to your patient email
+#define PATIENT_PASSWORD "patientpassword123"             // TODO: Change to your patient password
+
+// Vitals sending interval (send every 60 seconds)
+#define VITALS_SEND_INTERVAL 60000
+static unsigned long lastVitalsSentTime = 0;
+
 // ============= CONFIGURATION =============
 #define TIMETOBOOT 3000    // Wait for this time (msec) to output SpO2
 #define SAMPLING   100     // Display rate - higher = less frequent
@@ -49,22 +110,27 @@ static int sampleCounter = 0;
 static int displayCounter = 0;
 static unsigned long lastUpdateTime = 0;
 static unsigned long lastWiFiScanTime = 0;
+static unsigned long lastTemperatureUpdateTime = 0;
+static float currentDisplayTemperature = 36.6;
+String closestKnownAPName = "";
 
 // ============= WiFi KNOWN APs =============
 struct KnownAP {
   const char* name;
   const char* macAddress;
+  const char* password;  // Add password field
 };
 
 const KnownAP knownAPs[] = {
-  {"Hassan", "6a:bb:30:8c:73:4f"},
-  {"Fatma", "ee:27:8a:bf:0a:65"},
-  {"Router", "58:d7:59:6c:fa:d0"}
+  {"Hassan", "6a:bb:30:8c:73:4f", "12345678"},     // ← UPDATE WITH REAL PASSWORD
+  {"Mohamed", "da:6c:44:b6:ee:05", "12345678"}, // ← UPDATE WITH REAL PASSWORD
+  {"MyHome", "58:d7:59:6c:fa:d0", "ibrahassan376236*"}      // ← UPDATE WITH REAL PASSWORD
 };
 
 const int NUM_KNOWN_APS = sizeof(knownAPs) / sizeof(knownAPs[0]);
 
-#define WiFi_SCAN_INTERVAL 5000  // Scan WiFi every 5 seconds
+#define WiFi_SCAN_INTERVAL 10000  // Scan WiFi every 5 seconds
+#define TEMPERATURE_UPDATE_INTERVAL 1000  // Update DS18B20 every 1 second
 
 // ============= SETUP =============
 void setup()
@@ -74,6 +140,12 @@ void setup()
   Serial.setDebugOutput(true);
   delay(1000);
   Serial.println("\n\n=== CuraWatch Combined System Starting ===\n");
+
+  // Test preferences functionality
+  testPreferences();
+  
+  // Debug AuthenticationManager preferences state
+  authManager.debugPreferencesState();
 
   // Initialize I2C (call only once for both sensors!)
   Wire.begin();
@@ -107,6 +179,83 @@ void setup()
   Serial.println("\n=== All Sensors Ready ===\n");
   delay(2500);
 
+  // Initialize DS18B20 Temperature Sensor
+  Serial.println("Initializing DS18B20 Temperature Sensor...");
+  Serial.print("Using GPIO pin: ");
+  Serial.println(ONE_WIRE_BUS);
+  
+  // Check if any devices are found on the OneWire bus
+  Serial.print("Searching for OneWire devices...");
+  int deviceCount = tempSensor.getDeviceCount();
+  Serial.print("Found ");
+  Serial.print(deviceCount);
+  Serial.println(" devices");
+  
+  if (deviceCount == 0) {
+    Serial.println("⚠ No OneWire devices found!");
+    Serial.println("Check wiring: DS18B20 data pin should be connected to GPIO 5");
+    Serial.println("Ensure 4.7kΩ pull-up resistor between data and 3.3V");
+    Serial.println("Power connections: VCC to 3.3V, GND to GND");
+    
+    // Try to search for devices manually
+    Serial.println("Attempting manual device search...");
+    byte addr[8];
+    if (oneWire.search(addr)) {
+      Serial.print("Found device with address: ");
+      for (int i = 0; i < 8; i++) {
+        if (addr[i] < 16) Serial.print("0");
+        Serial.print(addr[i], HEX);
+        if (i < 7) Serial.print(":");
+      }
+      Serial.println();
+      
+      // Check if it's a DS18B20
+      if (addr[0] == 0x28) {
+        Serial.println("✓ Device is a DS18B20!");
+        Serial.println("Sensor is responding but DallasTemperature library may have issues");
+        Serial.println("Will continue with temperature readings despite device count = 0");
+      } else {
+        Serial.print("⚠ Device found but not DS18B20 (family code: 0x");
+        Serial.print(addr[0], HEX);
+        Serial.println(")");
+      }
+    } else {
+      Serial.println("No devices found on OneWire bus");
+      oneWire.reset_search();
+    }
+  } else {
+    Serial.println("✓ OneWire devices found successfully");
+  }
+  
+  tempSensor.begin();
+  tempSensor.setResolution(12);  // Set resolution to 12-bit (0.0625°C precision)
+  tempSensor.setWaitForConversion(false);  // Non-blocking mode
+  
+  // Request first temperature reading
+  Serial.println("Requesting temperature reading...");
+  tempSensor.requestTemperatures();
+  delay(100);
+  
+  float initialTemp = tempSensor.getTempCByIndex(0);
+  Serial.print("Raw temperature reading: ");
+  Serial.println(initialTemp);
+  
+  if (initialTemp != DEVICE_DISCONNECTED_C) {
+    Serial.print("✓ DS18B20 initialized successfully - Initial temp: ");
+    Serial.print(initialTemp);
+    Serial.println("°C");
+  } else {
+    Serial.println("ERROR: DS18B20 not found!");
+    Serial.println("Possible issues:");
+    Serial.println("  - Sensor not connected or faulty");
+    Serial.println("  - Wrong GPIO pin (currently GPIO 5)");
+    Serial.println("  - Missing pull-up resistor (4.7kΩ between data and 3.3V)");
+    Serial.println("  - Power supply issue");
+    Serial.println("Will continue without temperature sensor...");
+  }
+
+  delay(500);
+
   // Initialize TFT Display
   Serial.println("Initializing TFT Display...");
   initializeDisplay();
@@ -125,6 +274,80 @@ void setup()
     Serial.println(knownAPs[i].macAddress);
   }
   Serial.println();
+
+  // ============= AUTHENTICATION SETUP =============
+  Serial.println("\n=== Authentication Setup ===");
+  
+  // FIRST: Save credentials if this is the first run (uncomment the line below)
+  // Option 1: Save credentials automatically
+  // authManager.saveCredentials(PATIENT_EMAIL, PATIENT_PASSWORD);
+  // Serial.println("✓ New credentials saved to ESP32 storage\n");
+  
+  // Option 2: Save credentials manually (call this function once)
+  saveNewCredentials(PATIENT_EMAIL, PATIENT_PASSWORD);  // Remove this line after first run!
+  
+  // Check for stored credentials
+  String storedEmail, storedPassword;
+  if (authManager.loadCredentials(storedEmail, storedPassword)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(20, 100);
+    tft.println("Found stored");
+    tft.setCursor(20, 115);
+    tft.println("credentials");
+    Serial.println("✓ Found stored credentials");
+  } else {
+    Serial.println("[AUTH] No credentials found in storage");
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(20, 100);
+    tft.println("No credentials");
+    tft.setCursor(20, 115);
+    tft.println("found - check code");
+  }
+  
+  delay(2000); // Show message for 2 seconds
+  
+  // SECOND: Connect to WiFi first
+  Serial.println("\nConnecting to WiFi for NTP sync...");
+  Serial.println("⚠ IMPORTANT: Update WiFi passwords in knownAPs array above!");
+  connectToWiFi();
+  
+  // THIRD: Setup NTP time synchronization (now that WiFi is connected)
+  Serial.println("Setting up NTP time synchronization...");
+  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");  // Add timezone offset and more servers
+  delay(5000);  // Give more time for NTP sync
+  
+  // Verify time is set
+  time_t now = time(nullptr);
+  if (now > 1609459200) {  // Check if time is reasonable (after 2021)
+    Serial.println("✓ NTP time synchronized successfully");
+    Serial.print("Current time: ");
+    Serial.println(ctime(&now));
+  } else {
+    Serial.println("⚠ NTP sync may have failed - timestamps may be incorrect");
+    Serial.println("This could be due to network issues or firewall blocking NTP");
+    Serial.println("Will try to sync again in 30 seconds...");
+    
+    // Try alternative NTP servers
+    delay(30000);
+    configTime(3 * 3600, 0, "0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org");
+    delay(5000);
+    
+    now = time(nullptr);
+    if (now > 1609459200) {
+      Serial.println("✓ NTP sync successful on retry!");
+      Serial.print("Current time: ");
+      Serial.println(ctime(&now));
+    } else {
+      Serial.println("✗ NTP sync still failing - using device uptime for timestamps");
+    }
+  }
+
+  // Test sensors and show sample payload
+  testSensorsAndPayload();
 }
 
 // ============= MAIN LOOP =============
@@ -159,6 +382,18 @@ void loop()
     stepDetector.update();
     lastUpdateTime = currentTime;
   }
+  
+  // Refresh cached DS18B20 temperature reading
+  if (currentTime - lastTemperatureUpdateTime >= TEMPERATURE_UPDATE_INTERVAL) {
+    float ds18b20Temperature = tempSensor.getTempCByIndex(0);
+    if (ds18b20Temperature != DEVICE_DISCONNECTED_C &&
+        ds18b20Temperature >= 20.0 &&
+        ds18b20Temperature <= 45.0) {
+      currentDisplayTemperature = ds18b20Temperature;
+    }
+    tempSensor.requestTemperatures();
+    lastTemperatureUpdateTime = currentTime;
+  }
 
   // Display combined sensor data at reduced rate
   if ((displayCounter % SAMPLING) == 0) {
@@ -173,6 +408,17 @@ void loop()
   if (millis() - lastWiFiScanTime >= WiFi_SCAN_INTERVAL) {
     findClosestKnownAP();
     lastWiFiScanTime = millis();
+  }
+
+  // Send vitals periodically to backend (if authenticated)
+  if (currentTime - lastVitalsSentTime >= VITALS_SEND_INTERVAL) {
+    if (authManager.isAuthenticated()) {
+      sendVitalsToBackend();
+    } else {
+      // Try to auto-login if not authenticated
+      attemptAutoLogin();
+    }
+    lastVitalsSentTime = currentTime;
   }
 }
 
@@ -312,7 +558,7 @@ void initializeDisplay()
 }
 
 /**
- * Update the TFT display with current HR, SpO2, and Steps
+ * Update the TFT display with current HR, SpO2, Steps, and temperature
  */
 void updateTFTDisplay()
 {
@@ -329,21 +575,21 @@ void updateTFTDisplay()
   int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 0;
   float spo2 = heartRateSensor.getFilteredSpO2();
   int steps = stepDetector.getStepCount();
+  float temperature = currentDisplayTemperature;
   
   // Define colors
   uint16_t hrColor = getHRColor(hr);
   uint16_t spo2Color = getSPO2Color(spo2);
   uint16_t stepColor = TFT_CYAN;
+  uint16_t temperatureColor = TFT_ORANGE;
   
-  // Draw three metric boxes in a triangular arrangement
-  // Top center: Heart Rate
-  drawMetricBox(120, 20, "HR", String(hr), "bpm", hrColor, 35);
+  // Draw four metric boxes in a 2x2 arrangement
+  drawMetricBox(70, 30, "HR", String(hr), "bpm", hrColor, 35);
   
-  // Bottom left: SpO2
-  drawMetricBox(40, 140, "SpO2", String((int)spo2), "%", spo2Color, 30);
+  drawMetricBox(170, 30, "SpO2", String((int)spo2), "%", spo2Color, 30);
   
-  // Bottom right: Steps
-  drawMetricBox(200, 140, "STEPS", String(steps), "", stepColor, 30);
+  drawMetricBox(70, 120, "STEPS", String(steps), "", stepColor, 30);
+  drawMetricBox(170, 120, "TEMP", String(temperature, 1), "C", temperatureColor, 30);
   
   // Draw status indicators at bottom
   drawStatusBar();
@@ -498,6 +744,7 @@ void findClosestKnownAP() {
   int numNetworks = WiFi.scanNetworks();
   
   if (numNetworks == 0) {
+    closestKnownAPName = "";
     Serial.println("No networks found.");
     Serial.println("================================\n");
     return;
@@ -557,6 +804,7 @@ void findClosestKnownAP() {
   // Display results
   Serial.println("\n--- SCAN RESULTS ---");
   if (foundKnownAP) {
+    closestKnownAPName = closestName;
     Serial.println("Closest Known Access Point:");
     Serial.print("  Name: ");
     Serial.println(closestName);
@@ -568,6 +816,7 @@ void findClosestKnownAP() {
     Serial.print(closestRSSI);
     Serial.println(" dBm");
   } else {
+    closestKnownAPName = "";
     Serial.println("No known access points detected in scan.");
   }
   
@@ -576,3 +825,318 @@ void findClosestKnownAP() {
   // Clean up scan results memory
   WiFi.scanDelete();
 }
+
+// ============= AUTHENTICATION & BACKEND FUNCTIONS =============
+
+/**
+ * Connect to WiFi network using strongest known AP or SSID
+ */
+void connectToWiFi() {
+  Serial.println("\n========== WiFi CONNECTION ==========");
+  
+  // Try to find and connect to closest known AP
+  Serial.println("Scanning for known networks...");
+  int numNetworks = WiFi.scanNetworks();
+  
+  if (numNetworks == 0) {
+    Serial.println("No networks found.");
+    return;
+  }
+  
+  int closestRSSI = -200;
+  String closestSSID = "";
+  String closestPassword = "";
+  
+  for (int i = 0; i < numNetworks; i++) {
+    String ssid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    uint8_t* bssid = WiFi.BSSID(i);
+    String macAddress = macToString(bssid);
+    
+    String knownAPName;
+    if (isKnownAP(macAddress, knownAPName)) {
+      // Find the password for this known AP
+      for (int j = 0; j < NUM_KNOWN_APS; j++) {
+        if (macAddress.equalsIgnoreCase(String(knownAPs[j].macAddress))) {
+          if (rssi > closestRSSI) {
+            closestRSSI = rssi;
+            closestSSID = ssid;
+            closestPassword = String(knownAPs[j].password);
+          }
+          break;
+        }
+      }
+    }
+  }
+  
+  WiFi.scanDelete();
+  
+  if (closestSSID.isEmpty()) {
+    Serial.println("ERROR: No known WiFi networks available");
+    return;
+  }
+  
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(closestSSID);
+  
+  WiFi.begin(closestSSID.c_str(), closestPassword.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    
+    // Show WiFi connection on TFT
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(20, 100);
+    tft.println("WiFi Connected!");
+    tft.setCursor(20, 115);
+    tft.print("IP: ");
+    tft.println(WiFi.localIP());
+    
+    Serial.println("================================\n");
+  } else {
+    Serial.println("\nERROR: Failed to connect to WiFi");
+    Serial.println("Check WiFi passwords in knownAPs array");
+    
+    // Show WiFi error on TFT
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(20, 100);
+    tft.println("WiFi Failed!");
+    tft.setCursor(20, 115);
+    tft.println("Check passwords");
+    
+    Serial.println("================================\n");
+  }
+}
+
+/**
+ * Attempt to automatically login using stored credentials
+ */
+void attemptAutoLogin() {
+  Serial.println("\n========== AUTO-LOGIN ATTEMPT ==========");
+  
+  // Ensure WiFi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected to WiFi, cannot login");
+    connectToWiFi();
+    return;
+  }
+  
+  // Attempt auto-login
+  if (authManager.autoLogin(BACKEND_URL)) {
+    Serial.println("✓ Auto-login successful!");
+    displayAuthStatus(true);
+  } else {
+    Serial.print("✗ Auto-login failed: ");
+    Serial.println(authManager.getLastError());
+    
+    // Try manual login with configured credentials
+    Serial.println("\nAttempting manual login...");
+    if (authManager.login(PATIENT_EMAIL, PATIENT_PASSWORD, BACKEND_URL)) {
+      Serial.println("✓ Manual login successful!");
+      displayAuthStatus(true);
+    } else {
+      Serial.print("✗ Manual login failed: ");
+      Serial.println(authManager.getLastError());
+      displayAuthStatus(false);
+    }
+  }
+  Serial.println("================================\n");
+}
+
+/**
+ * Send current vitals to backend
+ */
+void sendVitalsToBackend() {
+  Serial.println("\n========== SENDING VITALS ==========");
+  
+  // Get current sensor values
+  int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 0;
+  float spo2 = heartRateSensor.getFilteredSpO2();
+  int steps = stepDetector.getStepCount();
+  
+  // Get temperature from DS18B20
+  tempSensor.requestTemperatures();
+  delay(100);  // Wait for conversion
+  float temperature = tempSensor.getTempCByIndex(0);
+  
+  // Validate temperature reading
+  if (temperature == DEVICE_DISCONNECTED_C) {
+    Serial.println("⚠ Temperature sensor disconnected, using default value");
+    temperature = 36.6;  // Normal body temperature
+  } else if (temperature < 20 || temperature > 45) {
+    Serial.print("⚠ Invalid temperature reading: ");
+    Serial.print(temperature);
+    Serial.println("°C, using default value");
+    temperature = 36.6;
+  }
+  
+  // Convert to Fahrenheit for display (optional)
+  float tempF = (temperature * 9.0/5.0) + 32.0;
+  
+  Serial.print("HR: ");
+  Serial.print(hr);
+  Serial.print(" | SpO2: ");
+  Serial.print(spo2);
+  Serial.print("% | Steps: ");
+  Serial.print(steps);
+  Serial.print(" | Temp: ");
+  Serial.print(temperature);
+  Serial.print("°C (");
+  Serial.print(tempF);
+  Serial.println("°F)");
+  
+  // Ensure WiFi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected to WiFi, skipping vitals send");
+    connectToWiFi();
+    Serial.println("================================\n");
+    return;
+  }
+  
+  // Send vitals (now includes temperature)
+  if (authManager.sendVitals(BACKEND_URL, hr, spo2, steps, temperature)) {
+    Serial.println("✓ Vitals sent successfully!");
+  } else {
+    Serial.print("✗ Failed to send vitals: ");
+    Serial.println(authManager.getLastError());
+    
+    // If authentication error detected, attempt to re-login
+    if (authManager.getLastError().indexOf("401") >= 0 || 
+        authManager.getLastError().indexOf("Not authenticated") >= 0) {
+      Serial.println("\nAuthentication error detected, attempting re-login...");
+      attemptAutoLogin();
+    }
+  }
+  
+  Serial.println("================================\n");
+}
+
+/**
+ * Display authentication status on TFT
+ */
+void displayAuthStatus(bool authenticated) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  
+  if (authenticated) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setCursor(30, 100);
+    tft.println("Authenticated");
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(40, 130);
+    tft.println("Ready to send vitals");
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(45, 100);
+    tft.println("Auth Failed");
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(30, 130);
+    tft.println("Check WiFi & Credentials");
+  }
+  
+  delay(2000);
+}
+
+/**
+ * Test function to verify DS18B20 sensor and show sample JSON payload
+ */
+void testSensorsAndPayload() {
+  Serial.println("\n========== SENSOR TEST & SAMPLE PAYLOAD ==========");
+  
+  // Get sensor readings
+  int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 72;  // Sample value
+  float spo2 = heartRateSensor.getFilteredSpO2();
+  int steps = stepDetector.getStepCount();
+  
+  // Get temperature
+  tempSensor.requestTemperatures();
+  delay(100);
+  float temperature = tempSensor.getTempCByIndex(0);
+  if (temperature == DEVICE_DISCONNECTED_C) {
+    temperature = 36.6;  // Sample value if sensor fails
+  }
+  
+  Serial.println("Current Sensor Readings:");
+  Serial.print("  Heart Rate: ");
+  Serial.print(hr);
+  Serial.println(" bpm");
+  Serial.print("  Oxygen (SpO2): ");
+  Serial.print(spo2);
+  Serial.println("%");
+  Serial.print("  Steps: ");
+  Serial.println(steps);
+  Serial.print("  Temperature: ");
+  Serial.print(temperature);
+  Serial.println("°C");
+  
+  // Show what will be sent to backend
+  Serial.println("\nJSON Payload that will be sent:");
+  String samplePayload = authManager.buildVitalsJSON(hr, spo2, steps, temperature);
+  Serial.println(samplePayload);
+  
+  Serial.println("===========================================\n");
+}
+
+/**
+ * Manually save credentials (call this once to store credentials)
+ * Example: saveNewCredentials("user@example.com", "password123");
+ */
+void saveNewCredentials(const char* email, const char* password) {
+  Serial.print("\nManually saving credentials for: ");
+  Serial.println(email);
+  authManager.saveCredentials(email, password);
+  Serial.println("✓ Credentials saved\n");
+}
+
+/**
+ * Get current stored email (if any)
+ */
+String getStoredEmail() {
+  String email, password;
+  if (authManager.loadCredentials(email, password)) {
+    return email;
+  }
+  return "Not stored";
+}
+
+/**
+ * Display current authentication state
+ */
+void printAuthStatus() {
+  Serial.println("\n========== AUTHENTICATION STATUS ==========");
+  
+  if (authManager.isAuthenticated()) {
+    Serial.println("Status: AUTHENTICATED ✓");
+    Serial.print("Token: ");
+    Serial.println(authManager.getToken().substring(0, 30) + "...");
+    
+    if (authManager.tokenExpired()) {
+      Serial.println("WARNING: Token may be expired!");
+    } else {
+      Serial.println("Token status: Valid");
+    }
+  } else {
+    Serial.println("Status: NOT AUTHENTICATED");
+    Serial.println("Next: Call attemptAutoLogin() to login");
+  }
+  
+  Serial.println("==========================================\n");
+}
+
