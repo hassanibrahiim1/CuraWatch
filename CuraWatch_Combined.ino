@@ -122,9 +122,9 @@ struct KnownAP {
 };
 
 const KnownAP knownAPs[] = {
-  {"Hassan", "6a:bb:30:8c:73:4f", "12345678"},     // ← UPDATE WITH REAL PASSWORD
-  {"Mohamed", "da:6c:44:b6:ee:05", "12345678"}, // ← UPDATE WITH REAL PASSWORD
-  {"MyHome", "58:d7:59:6c:fa:d0", "ibrahassan376236*"}      // ← UPDATE WITH REAL PASSWORD
+  {"name1", "BSSID1", "password1"},     // ← UPDATE WITH REAL PASSWORD
+  {"name2", "BSSID2", "password2"}, // ← UPDATE WITH REAL PASSWORD
+  {"name3", "BSSID3", "password3*"}      // ← UPDATE WITH REAL PASSWORD
 };
 
 const int NUM_KNOWN_APS = sizeof(knownAPs) / sizeof(knownAPs[0]);
