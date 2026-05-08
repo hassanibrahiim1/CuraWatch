@@ -8,12 +8,13 @@ public:
   HeartRateMonitor();
   
   // Heart rate detection and processing
-  void detectBeat(uint32_t ir);
+  bool detectBeat(uint32_t ir, uint32_t timestampMicros = 0);
   bool isValidHR() const;
   
   // Getters
   float getBeatsPerMinute() const;
   int getAverageHR() const;
+  uint32_t getLastBeatTimeMicros() const;
   
   // Reset when finger is removed
   void reset();
@@ -23,7 +24,7 @@ private:
   static const byte RATE_SIZE = 8;
   byte rates[RATE_SIZE];
   byte rateSpot;
-  long lastBeat;
+  uint32_t lastBeatTimeMicros;
   
   // HR values
   float beatsPerMinute;
@@ -33,7 +34,7 @@ private:
   // Validation thresholds
   static const int MIN_HR = 40;
   static const int MAX_HR = 180;
-  static const int MIN_DELTA = 300;  // Minimum ms between beats (200 bpm max)
+  static const int MIN_DELTA_US = 300000;  // Minimum us between beats (200 bpm max)
   static const int FINGER_ON = 30000;
   static const int MIN_READINGS = 3; // Need at least 3 readings for valid average
   

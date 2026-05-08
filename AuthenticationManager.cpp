@@ -1,5 +1,6 @@
 #include "AuthenticationManager.h"
 #include <Arduino.h>
+#include <math.h>
 
 extern String closestKnownAPName;
 
@@ -422,7 +423,14 @@ String AuthenticationManager::createAuthHeader() const {
 /**
  * Build vitals JSON payload
  */
-String AuthenticationManager::buildVitalsJSON(int heartRate, float spo2, int steps, float temperature) const {
+String AuthenticationManager::buildVitalsJSON(int heartRate,
+                                              float spo2,
+                                              int steps,
+                                              float temperature,
+                                              const float* ppg,
+                                              int ppgCount,
+                                              const float* ecg,
+                                              int ecgCount) const {
   // Validate and clamp values
   if (spo2 < 0) spo2 = 0;
   if (spo2 > 100) spo2 = 100;
@@ -435,13 +443,35 @@ String AuthenticationManager::buildVitalsJSON(int heartRate, float spo2, int ste
     temperature = 36.6;
   }
   
+  size_t docSize = 768;
+  if (ppg && ppgCount > 0) {
+    docSize += (size_t)ppgCount * 16;
+  }
+  if (ecg && ecgCount > 0) {
+    docSize += (size_t)ecgCount * 16;
+  }
+
   // Create JSON document
-  DynamicJsonDocument doc(768);
+  DynamicJsonDocument doc(docSize);
   
   doc["heart_rate"] = heartRate;
   doc["oxygen"] = round(spo2);  // Round to integer as backend expects 0-100
   doc["steps"] = steps;
   doc["temperature"] = temperature;
+
+  if (ppg && ppgCount > 0) {
+    JsonArray ppgArray = doc.createNestedArray("ppg");
+    for (int i = 0; i < ppgCount; i++) {
+      ppgArray.add(roundf(ppg[i] * 10000.0f) / 10000.0f);
+    }
+  }
+
+  if (ecg && ecgCount == ppgCount && ecgCount > 0) {
+    JsonArray ecgArray = doc.createNestedArray("ecg");
+    for (int i = 0; i < ecgCount; i++) {
+      ecgArray.add(roundf(ecg[i] * 10000.0f) / 10000.0f);
+    }
+  }
   
   String currentLocationName = closestKnownAPName;
   if (!currentLocationName.isEmpty()) {
@@ -466,7 +496,15 @@ String AuthenticationManager::buildVitalsJSON(int heartRate, float spo2, int ste
 /**
  * Send vitals to backend
  */
-bool AuthenticationManager::sendVitals(const char* backendURL, int heartRate, float spo2, int steps, float temperature) {
+bool AuthenticationManager::sendVitals(const char* backendURL,
+                                       int heartRate,
+                                       float spo2,
+                                       int steps,
+                                       float temperature,
+                                       const float* ppg,
+                                       int ppgCount,
+                                       const float* ecg,
+                                       int ecgCount) {
   if (!isAuthenticated()) {
     lastError = "Not authenticated - no valid token";
     Serial.println("[AUTH] ERROR: Cannot send vitals - not authenticated");
@@ -494,7 +532,7 @@ bool AuthenticationManager::sendVitals(const char* backendURL, int heartRate, fl
   http.addHeader("Authorization", authHeader);
   
   // Build payload
-  String payload = buildVitalsJSON(heartRate, spo2, steps, temperature);
+  String payload = buildVitalsJSON(heartRate, spo2, steps, temperature, ppg, ppgCount, ecg, ecgCount);
   
   Serial.print("[AUTH] Payload: ");
   Serial.println(payload);

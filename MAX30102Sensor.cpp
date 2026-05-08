@@ -15,7 +15,7 @@ bool MAX30102Sensor::begin() {
   
   // Configure sensor
   byte ledBrightness = 0x7F;   // 0=Off to 255=50mA
-  byte sampleAverage = 4;       // Options: 1, 2, 4, 8, 16, 32
+  byte sampleAverage = 1;       // 1 keeps the FIFO output at the configured sampleRate
   byte ledMode = 2;             // 2 = Red + IR
   int sampleRate = 200;         // Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
   int pulseWidth = 411;         // Options: 69, 118, 215, 411

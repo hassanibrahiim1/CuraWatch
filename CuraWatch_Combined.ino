@@ -20,7 +20,10 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <time.h>
+#include "AD8232Sensor.h"
+#include "BPFeatureExtractor.h"
 #include "MAX30102Sensor.h"
+#include "PPGWindowBuilder.h"
 #include "HeartRateMonitor.h"
 #include "StepDetector.h"
 #include "AuthenticationManager.h"
@@ -40,7 +43,10 @@ TFT_eSPI tft = TFT_eSPI();
 #define DISPLAY_HEIGHT 240
 
 // ============= SENSOR INSTANCES =============
+AD8232Sensor ecgSensor;
+BPFeatureExtractor bpFeatureExtractor;
 MAX30102Sensor heartRateSensor;
+PPGWindowBuilder ppgWindowBuilder;
 HeartRateMonitor hrMonitor;
 StepDetector stepDetector;
 
@@ -93,17 +99,34 @@ void testPreferences() {
 // Backend configuration
 #define BACKEND_URL "https://cura-watch.onrender.com"  // TODO: Change to your backend server IP/address
 #define PATIENT_EMAIL "mustafa.ahmed.00878@gmail.com"     // TODO: Change to your patient email
-#define PATIENT_PASSWORD "patientpassword123"             // TODO: Change to your patient password
+#define PATIENT_PASSWORD "123456"             // TODO: Change to your patient password
 
 // Vitals sending interval (send every 60 seconds)
 #define VITALS_SEND_INTERVAL 60000
 static unsigned long lastVitalsSentTime = 0;
 
 // ============= CONFIGURATION =============
+#define ECG_OFFLINE_MODE false
 #define TIMETOBOOT 3000    // Wait for this time (msec) to output SpO2
-#define SAMPLING   100     // Display rate - higher = less frequent
+#define SAMPLING   200     // Display/TFT refresh divider for MAX30102 samples
 #define USEFIFO            // Use FIFO mode for MAX30102
 #define UPDATE_INTERVAL 200 // Update interval in milliseconds
+#define ENABLE_VERBOSE_SENSOR_LOG false
+#define ENABLE_BACKGROUND_WIFI_SCAN false
+#define ENABLE_PPG_WINDOW_UPLOAD true
+#define ML_USE_ECG_WINDOW false
+#define PPG_UPLOAD_RETRY_INTERVAL 5000
+
+// AD8232 wiring for ESP32
+//   AD8232 OUT  -> GPIO34 (ADC1, input-only pin)
+//   AD8232 LO+  -> GPIO32
+//   AD8232 LO-  -> GPIO33
+#define ECG_SIGNAL_PIN 34
+#define ECG_LO_PLUS_PIN 32
+#define ECG_LO_MINUS_PIN 33
+#define ECG_SAMPLE_RATE_HZ 250
+#define ECG_ENABLE_RAW_STREAM false
+#define ECG_RAW_STREAM_DIVIDER 5
 
 // ============= GLOBAL VARIABLES =============
 static int sampleCounter = 0;
@@ -111,8 +134,19 @@ static int displayCounter = 0;
 static unsigned long lastUpdateTime = 0;
 static unsigned long lastWiFiScanTime = 0;
 static unsigned long lastTemperatureUpdateTime = 0;
+static unsigned long lastPPGUploadAttemptTime = 0;
 static float currentDisplayTemperature = 36.6;
+static uint16_t ecgRawSampleCounter = 0;
+static bool mlWindowPending = false;
 String closestKnownAPName = "";
+
+// Forward declarations for offline ECG helpers
+void processECGSample();
+void displayECGData();
+void displayBPFeatureData();
+void printBPFeatureCSV();
+void sendPPGWindowWithVitals();
+void printMLWindowPreview();
 
 // ============= WiFi KNOWN APs =============
 struct KnownAP {
@@ -122,9 +156,9 @@ struct KnownAP {
 };
 
 const KnownAP knownAPs[] = {
-  {"name1", "BSSID1", "password1"},     // ← UPDATE WITH REAL PASSWORD
-  {"name2", "BSSID2", "password2"}, // ← UPDATE WITH REAL PASSWORD
-  {"name3", "BSSID3", "password3*"}      // ← UPDATE WITH REAL PASSWORD
+  {"Hassan", "6a:bb:30:8c:73:4f", "12345678"},     // ← UPDATE WITH REAL PASSWORD
+  {"Mohamed", "da:6c:44:b6:ee:05", "12345678"}, // ← UPDATE WITH REAL PASSWORD
+  {"MyHome", "58:d7:59:6c:fa:d0", "ibrahassan376236*"}      // ← UPDATE WITH REAL PASSWORD
 };
 
 const int NUM_KNOWN_APS = sizeof(knownAPs) / sizeof(knownAPs[0]);
@@ -141,11 +175,27 @@ void setup()
   delay(1000);
   Serial.println("\n\n=== CuraWatch Combined System Starting ===\n");
 
-  // Test preferences functionality
-  testPreferences();
-  
-  // Debug AuthenticationManager preferences state
-  authManager.debugPreferencesState();
+  if (!ECG_OFFLINE_MODE) {
+    // Test preferences functionality
+    testPreferences();
+    
+    // Debug AuthenticationManager preferences state
+    authManager.debugPreferencesState();
+  }
+
+  Serial.println("Initializing AD8232 ECG Sensor...");
+  if (!ecgSensor.begin(ECG_SIGNAL_PIN, ECG_LO_PLUS_PIN, ECG_LO_MINUS_PIN, ECG_SAMPLE_RATE_HZ)) {
+    Serial.println("ERROR: AD8232 failed to initialize!");
+  } else {
+    Serial.println("✓ AD8232 initialized successfully");
+    Serial.print("  ECG OUT -> GPIO ");
+    Serial.println(ECG_SIGNAL_PIN);
+    Serial.print("  LO+ -> GPIO ");
+    Serial.println(ECG_LO_PLUS_PIN);
+    Serial.print("  LO- -> GPIO ");
+    Serial.println(ECG_LO_MINUS_PIN);
+  }
+  delay(250);
 
   // Initialize I2C (call only once for both sensors!)
   Wire.begin();
@@ -163,6 +213,11 @@ void setup()
     Serial.println("ERROR: MAX30102 failed to initialize!");
   } else {
     Serial.println("✓ MAX30102 initialized successfully");
+    Serial.println("  MAX30102 PPG capture profile:");
+    Serial.println("    Sample rate: 200 Hz");
+    Serial.println("    FIFO averaging: 1 (no decimation)");
+    Serial.println("    Raw capture window: 200 IR samples (~1.00 s)");
+    Serial.println("    Model window: 125 normalized PPG floats");
   }
 
   delay(500);
@@ -261,6 +316,12 @@ void setup()
   initializeDisplay();
   Serial.println("✓ TFT Display initialized successfully\n");
 
+  if (ECG_OFFLINE_MODE) {
+    Serial.println("\n=== Offline ECG/BP Feature Mode ===");
+    Serial.println("WiFi scan, authentication, NTP sync, and backend sends are skipped.");
+    Serial.println("Use Serial Monitor for ECG summaries and BP-estimation features.");
+    Serial.println("Optional raw ECG stream can be enabled with ECG_ENABLE_RAW_STREAM.\n");
+  } else {
   // Initialize WiFi in station mode (scan only, no connection)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();  // Turn off auto-connect
@@ -346,29 +407,52 @@ void setup()
     }
   }
 
-  // Test sensors and show sample payload
-  testSensorsAndPayload();
+  Serial.println("Vitals payload mode enabled.");
+  Serial.println("The sketch will add one 125-sample normalized PPG window to the old JSON.");
+  Serial.println("If the PPG window is not ready yet, it will not send.");
+  }
 }
 
 // ============= MAIN LOOP =============
 void loop()
 {
+  if (ecgSensor.update()) {
+    processECGSample();
+  }
+
   // Handle MAX30102 data (continuous)
   #ifdef USEFIFO
   heartRateSensor.check();
 
   while (heartRateSensor.hasData()) {
+    if (ecgSensor.update()) {
+      processECGSample();
+    }
+
     uint32_t red, ir;
     heartRateSensor.readSensor(red, ir);
+    uint32_t ppgSampleTimeMicros = micros();
     
     sampleCounter++;
     displayCounter++;
     
     // Update sensor data and SpO2 calculation
     heartRateSensor.updateSpO2(red, ir);
+    if (!mlWindowPending && ENABLE_PPG_WINDOW_UPLOAD) {
+      if (ppgWindowBuilder.addSample((float)ir, heartRateSensor.isFingerDetected())) {
+        mlWindowPending = true;
+        printMLWindowPreview();
+      }
+    }
     
     // Heart rate detection
-    hrMonitor.detectBeat(ir);
+    bool ppgBeatDetected = hrMonitor.detectBeat(ir, ppgSampleTimeMicros);
+    if (ppgBeatDetected) {
+      bpFeatureExtractor.registerPPGBeat(ppgSampleTimeMicros, heartRateSensor.isFingerDetected());
+      if (bpFeatureExtractor.hasNewPAT()) {
+        printBPFeatureCSV();
+      }
+    }
     
     if (sampleCounter >= 100) {
       sampleCounter = 0;
@@ -381,6 +465,13 @@ void loop()
   if (currentTime - lastUpdateTime >= UPDATE_INTERVAL) {
     stepDetector.update();
     lastUpdateTime = currentTime;
+  }
+
+  if (mlWindowPending &&
+      !ECG_OFFLINE_MODE &&
+      millis() - lastPPGUploadAttemptTime >= PPG_UPLOAD_RETRY_INTERVAL) {
+    sendPPGWindowWithVitals();
+    lastPPGUploadAttemptTime = millis();
   }
   
   // Refresh cached DS18B20 temperature reading
@@ -398,28 +489,23 @@ void loop()
   // Display combined sensor data at reduced rate
   if ((displayCounter % SAMPLING) == 0) {
     if (millis() > TIMETOBOOT) {
-      displayCombinedData();
+      if (ENABLE_VERBOSE_SENSOR_LOG) {
+        displayCombinedData();
+      }
       updateTFTDisplay();  // Update TFT display
     }
     displayCounter = 0;
   }
 
   // Perform WiFi scan at specified interval
-  if (millis() - lastWiFiScanTime >= WiFi_SCAN_INTERVAL) {
+  if (!ECG_OFFLINE_MODE &&
+      ENABLE_BACKGROUND_WIFI_SCAN &&
+      millis() - lastWiFiScanTime >= WiFi_SCAN_INTERVAL) {
     findClosestKnownAP();
     lastWiFiScanTime = millis();
   }
 
-  // Send vitals periodically to backend (if authenticated)
-  if (currentTime - lastVitalsSentTime >= VITALS_SEND_INTERVAL) {
-    if (authManager.isAuthenticated()) {
-      sendVitalsToBackend();
-    } else {
-      // Try to auto-login if not authenticated
-      attemptAutoLogin();
-    }
-    lastVitalsSentTime = currentTime;
-  }
+  // Legacy time-based vitals upload is intentionally disabled here.
 }
 
 // ============= DISPLAY FUNCTIONS =============
@@ -437,6 +523,15 @@ void displayCombinedData()
   
   // Display Step Counter & Motion Data
   displayStepData();
+
+  Serial.println("---");
+
+  // Display AD8232 ECG data and BP-oriented timing features
+  displayECGData();
+
+  Serial.println("---");
+
+  displayBPFeatureData();
   
   Serial.println("================================\n");
 }
@@ -523,6 +618,231 @@ void displaySimplifiedData()
   Serial.print(" | Accel: ");
   Serial.print(stepDetector.getAccelMagnitude());
   Serial.println(" m/s²");
+}
+
+void processECGSample()
+{
+  if (ecgSensor.consumeBeatDetected()) {
+    bpFeatureExtractor.registerECGPeak(ecgSensor.getLastRPeakTimeMicros());
+  }
+
+  if (!ECG_ENABLE_RAW_STREAM || !ecgSensor.hasNewSample()) {
+    return;
+  }
+
+  ecgRawSampleCounter++;
+  if (ecgRawSampleCounter < ECG_RAW_STREAM_DIVIDER) {
+    return;
+  }
+
+  ecgRawSampleCounter = 0;
+
+  AD8232Sensor::Sample sample = ecgSensor.getLatestSample();
+  Serial.print("ECG_RAW,");
+  Serial.print(sample.timestampMicros);
+  Serial.print(",");
+  Serial.print(sample.raw);
+  Serial.print(",");
+  Serial.print(sample.filtered, 2);
+  Serial.print(",");
+  Serial.println(sample.leadOff ? 1 : 0);
+}
+
+void displayECGData()
+{
+  AD8232Sensor::Sample sample = ecgSensor.getLatestSample();
+
+  Serial.println("[AD8232 ECG]");
+  Serial.print("  Lead Status: ");
+  Serial.println(sample.leadOff ? "OFF / CHECK ELECTRODES" : "Connected");
+
+  if (sample.timestampMicros == 0) {
+    Serial.println("  ECG Status: Waiting for first samples...");
+    return;
+  }
+
+  Serial.print("  Raw ADC: ");
+  Serial.println(sample.raw);
+
+  Serial.print("  Filtered ECG: ");
+  Serial.println(sample.filtered, 2);
+
+  Serial.print("  Signal Quality: ");
+  Serial.print(ecgSensor.getSignalQuality() * 100.0f, 0);
+  Serial.println("%");
+
+  if (!ecgSensor.hasValidSignal()) {
+    Serial.println("  ECG Status: Stabilizing / noisy");
+    return;
+  }
+
+  Serial.print("  ECG HR: ");
+  if (ecgSensor.getHeartRateBpm() > 0.0f) {
+    Serial.print(ecgSensor.getHeartRateBpm(), 1);
+    Serial.println(" bpm");
+  } else {
+    Serial.println("Calculating...");
+  }
+
+  Serial.print("  RR Interval: ");
+  if (ecgSensor.getLastRRIntervalMs() > 0) {
+    Serial.print(ecgSensor.getLastRRIntervalMs());
+    Serial.println(" ms");
+  } else {
+    Serial.println("--");
+  }
+
+  Serial.print("  QRS Peak Amplitude: ");
+  Serial.println(ecgSensor.getLastQRSAmplitude(), 2);
+}
+
+void displayBPFeatureData()
+{
+  Serial.println("[BP ESTIMATION FEATURES]");
+
+  Serial.print("  PPG Finger State: ");
+  Serial.println(heartRateSensor.isFingerDetected() ? "Detected" : "Not detected");
+
+  Serial.print("  Latest ECG R-Peak Time: ");
+  if (bpFeatureExtractor.getLastECGPeakTimeMicros() > 0) {
+    Serial.print(bpFeatureExtractor.getLastECGPeakTimeMicros());
+    Serial.println(" us");
+  } else {
+    Serial.println("--");
+  }
+
+  Serial.print("  Latest PPG Beat Time: ");
+  if (bpFeatureExtractor.getLastPPGBeatTimeMicros() > 0) {
+    Serial.print(bpFeatureExtractor.getLastPPGBeatTimeMicros());
+    Serial.println(" us");
+  } else {
+    Serial.println("--");
+  }
+
+  Serial.print("  Latest PAT: ");
+  if (bpFeatureExtractor.getLatestPATms() > 0.0f) {
+    Serial.print(bpFeatureExtractor.getLatestPATms(), 1);
+    Serial.println(" ms");
+  } else {
+    Serial.println("Waiting for ECG + PPG beats...");
+  }
+
+  Serial.print("  Average PAT: ");
+  if (bpFeatureExtractor.getAveragePATms() > 0.0f) {
+    Serial.print(bpFeatureExtractor.getAveragePATms(), 1);
+    Serial.println(" ms");
+  } else {
+    Serial.println("--");
+  }
+
+  Serial.print("  PPG HR: ");
+  if (hrMonitor.isValidHR()) {
+    Serial.print(hrMonitor.getAverageHR());
+    Serial.println(" bpm");
+  } else {
+    Serial.println("--");
+  }
+
+  Serial.print("  PPG DC IR: ");
+  Serial.println(heartRateSensor.getAveragedIR(), 0);
+
+  Serial.print("  PPG DC Red: ");
+  Serial.println(heartRateSensor.getAveragedRed(), 0);
+}
+
+void printBPFeatureCSV()
+{
+  Serial.print("BP_FEATURE,");
+  Serial.print(bpFeatureExtractor.getLastECGPeakTimeMicros());
+  Serial.print(",");
+  Serial.print(bpFeatureExtractor.getLastPPGBeatTimeMicros());
+  Serial.print(",");
+  Serial.print(bpFeatureExtractor.getLatestPATms(), 1);
+  Serial.print(",");
+  Serial.print(bpFeatureExtractor.getAveragePATms(), 1);
+  Serial.print(",");
+  Serial.print(ecgSensor.getHeartRateBpm(), 1);
+  Serial.print(",");
+  Serial.print(ecgSensor.getLastRRIntervalMs());
+  Serial.print(",");
+  Serial.print(ecgSensor.getSignalQuality(), 3);
+  Serial.print(",");
+  Serial.print(hrMonitor.getBeatsPerMinute(), 1);
+  Serial.print(",");
+  Serial.print(heartRateSensor.getAveragedIR(), 0);
+  Serial.print(",");
+  Serial.println(heartRateSensor.getAveragedRed(), 0);
+
+  bpFeatureExtractor.clearNewPAT();
+}
+
+void printMLWindowPreview()
+{
+  if (!ppgWindowBuilder.isWindowReady()) {
+    return;
+  }
+
+  const float* ppgWindow = ppgWindowBuilder.getWindow();
+
+  Serial.println("\n[PPG WINDOW]");
+  Serial.println("  One 125-sample PPG window is ready.");
+  Serial.print("  Normalized min/max source range: ");
+  Serial.print(ppgWindowBuilder.getLastWindowMin(), 0);
+  Serial.print(" -> ");
+  Serial.println(ppgWindowBuilder.getLastWindowMax(), 0);
+  Serial.print("  Preview: ");
+  for (int i = 0; i < 5; i++) {
+    if (i > 0) {
+      Serial.print(", ");
+    }
+    Serial.print(ppgWindow[i], 4);
+  }
+  Serial.println();
+}
+
+void sendPPGWindowWithVitals()
+{
+  if (!mlWindowPending || !ppgWindowBuilder.isWindowReady()) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[PPG] WiFi disconnected, reconnecting before upload...");
+    connectToWiFi();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[PPG] WiFi still unavailable, keeping current PPG window for retry.");
+      return;
+    }
+  }
+
+  if (!authManager.isAuthenticated()) {
+    Serial.println("[PPG] Not authenticated, attempting login before upload...");
+    attemptAutoLogin();
+    if (!authManager.isAuthenticated()) {
+      Serial.println("[PPG] Login failed, keeping current PPG window for retry.");
+      return;
+    }
+  }
+
+  const float* ppgWindow = ppgWindowBuilder.getWindow();
+  int ppgCount = ppgWindowBuilder.getWindowSize();
+  int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 0;
+  float spo2 = heartRateSensor.getFilteredSpO2();
+  int steps = stepDetector.getStepCount();
+
+  float temperature = currentDisplayTemperature;
+  if (temperature == DEVICE_DISCONNECTED_C || temperature < 20.0f || temperature > 45.0f) {
+    temperature = 36.6f;
+  }
+
+  if (authManager.sendVitals(BACKEND_URL, hr, spo2, steps, temperature, ppgWindow, ppgCount)) {
+    Serial.println("[PPG] Vitals + PPG window uploaded successfully.");
+    ppgWindowBuilder.consumeWindow();
+    mlWindowPending = false;
+  } else {
+    Serial.print("[PPG] Failed to upload PPG window: ");
+    Serial.println(authManager.getLastError());
+  }
 }
 
 // ============= TFT DISPLAY FUNCTIONS =============
@@ -1055,10 +1375,10 @@ void displayAuthStatus(bool authenticated) {
 }
 
 /**
- * Test function to verify DS18B20 sensor and show sample JSON payload
+ * Test function to preview the vitals JSON once a PPG window is ready
  */
 void testSensorsAndPayload() {
-  Serial.println("\n========== SENSOR TEST & SAMPLE PAYLOAD ==========");
+  Serial.println("\n========== PPG WINDOW TEST ==========");
   
   // Get sensor readings
   int hr = hrMonitor.isValidHR() ? hrMonitor.getAverageHR() : 72;  // Sample value
@@ -1088,7 +1408,15 @@ void testSensorsAndPayload() {
   
   // Show what will be sent to backend
   Serial.println("\nJSON Payload that will be sent:");
-  String samplePayload = authManager.buildVitalsJSON(hr, spo2, steps, temperature);
+  String samplePayload = ppgWindowBuilder.isWindowReady()
+      ? authManager.buildVitalsJSON(
+            hr,
+            spo2,
+            steps,
+            temperature,
+            ppgWindowBuilder.getWindow(),
+            ppgWindowBuilder.getWindowSize())
+      : String("{\"status\":\"ppg_not_ready\"}");
   Serial.println(samplePayload);
   
   Serial.println("===========================================\n");

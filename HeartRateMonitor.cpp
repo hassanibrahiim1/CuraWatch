@@ -1,25 +1,31 @@
 #include "HeartRateMonitor.h"
 
 HeartRateMonitor::HeartRateMonitor() 
-  : rateSpot(0), lastBeat(0), beatsPerMinute(0), beatAvg(0), validHR(false) {
+  : rateSpot(0), lastBeatTimeMicros(0), beatsPerMinute(0), beatAvg(0), validHR(false) {
   for (byte x = 0; x < RATE_SIZE; x++) {
     rates[x] = 0;
   }
 }
 
-void HeartRateMonitor::detectBeat(uint32_t ir) {
+bool HeartRateMonitor::detectBeat(uint32_t ir, uint32_t timestampMicros) {
   if (ir < FINGER_ON) {
-    return; // Finger not detected
+    return false; // Finger not detected
+  }
+
+  if (timestampMicros == 0) {
+    timestampMicros = micros();
   }
   
   if (checkForBeat(ir) == true) {
     // We sensed a beat!
-    long delta = millis() - lastBeat;
+    uint32_t delta = timestampMicros - lastBeatTimeMicros;
     
     // Validate the time between beats
-    if (delta > MIN_DELTA) {
-      lastBeat = millis();
-      beatsPerMinute = 60 / (delta / 1000.0);
+    if (lastBeatTimeMicros == 0 || delta > MIN_DELTA_US) {
+      lastBeatTimeMicros = timestampMicros;
+      if (delta > 0) {
+        beatsPerMinute = 60000000.0f / delta;
+      }
       
       // Only store valid heart rate values
       if (beatsPerMinute < MAX_HR && beatsPerMinute > MIN_HR) {
@@ -27,8 +33,12 @@ void HeartRateMonitor::detectBeat(uint32_t ir) {
         rateSpot %= RATE_SIZE;
         calculateAverage();
       }
+
+      return true;
     }
   }
+
+  return false;
 }
 
 void HeartRateMonitor::calculateAverage() {
@@ -60,8 +70,13 @@ int HeartRateMonitor::getAverageHR() const {
   return beatAvg;
 }
 
+uint32_t HeartRateMonitor::getLastBeatTimeMicros() const {
+  return lastBeatTimeMicros;
+}
+
 void HeartRateMonitor::reset() {
   validHR = false;
+  lastBeatTimeMicros = 0;
   for (byte x = 0; x < RATE_SIZE; x++) {
     rates[x] = 0;
   }

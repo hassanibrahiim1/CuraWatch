@@ -31,10 +31,25 @@ public:
   bool tokenExpired() const; // Simple check based on time
   
   // Vitals sending
-  bool sendVitals(const char* backendURL, int heartRate, float spo2, int steps, float temperature);
+  bool sendVitals(const char* backendURL,
+                  int heartRate,
+                  float spo2,
+                  int steps,
+                  float temperature,
+                  const float* ppg = nullptr,
+                  int ppgCount = 0,
+                  const float* ecg = nullptr,
+                  int ecgCount = 0);
   
   // Public utility functions
-  String buildVitalsJSON(int heartRate, float spo2, int steps, float temperature) const;
+  String buildVitalsJSON(int heartRate,
+                         float spo2,
+                         int steps,
+                         float temperature,
+                         const float* ppg = nullptr,
+                         int ppgCount = 0,
+                         const float* ecg = nullptr,
+                         int ecgCount = 0) const;
   
   // Error handling
   String getLastError() const { return lastError; }
