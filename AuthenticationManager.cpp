@@ -14,7 +14,7 @@ const char* AuthenticationManager::KEY_TOKEN = "token";
  * Constructor - Initialize preferences and load stored token
  */
 AuthenticationManager::AuthenticationManager() 
-  : tokenSavedTime(0), lastError("") {
+  : tokenSavedTime(0), lastError(""), lastMLWarning("") {
   
   Serial.println("[AUTH] Constructor: Initializing preferences...");
   Serial.print("[AUTH] Using namespace: ");
@@ -300,6 +300,50 @@ bool AuthenticationManager::parseLoginResponse(const String& jsonResponse, Strin
   return true;
 }
 
+bool AuthenticationManager::parseVitalsMLWarning(const String& jsonResponse, String& warning) const {
+  warning = "";
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, jsonResponse);
+  if (error) {
+    return false;
+  }
+
+  JsonVariant metadata = doc["data"]["ml_metadata"];
+  if (metadata.isNull()) {
+    return false;
+  }
+
+  int status = metadata["status"] | 0;
+  const char* mlError = metadata["error"] | "";
+  bool hasError = mlError && strlen(mlError) > 0;
+
+  if (status >= 400 || hasError) {
+    warning = hasError ? String(mlError) : String("ML status ") + String(status);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Print raw server replies to the Serial Monitor for debugging
+ */
+void AuthenticationManager::logServerResponse(const char* context, int httpResponseCode, const String& response) const {
+  Serial.print(context);
+  Serial.print(" HTTP status: ");
+  Serial.println(httpResponseCode);
+
+  Serial.print(context);
+  Serial.println(" response body:");
+  if (response.isEmpty()) {
+    Serial.println("<empty>");
+    return;
+  }
+
+  Serial.println(response);
+}
+
 /**
  * Perform login with email and password
  */
@@ -338,9 +382,12 @@ bool AuthenticationManager::login(const char* email, const char* password, const
   // Send POST request
   Serial.println("[AUTH] DEBUG: Sending POST request...");
   int httpResponseCode = http.POST(payload);
+  String response = http.getString();
+  http.end();
   
   Serial.print("[AUTH] DEBUG: HTTP response code: ");
   Serial.println(httpResponseCode);
+  logServerResponse("[AUTH][LOGIN]", httpResponseCode, response);
   
   if (httpResponseCode != 200) {
     Serial.print("[AUTH] ERROR: HTTP ");
@@ -355,19 +402,11 @@ bool AuthenticationManager::login(const char* email, const char* password, const
     } else if (httpResponseCode == 404) {
       Serial.println("[AUTH] DEBUG: Endpoint not found (404)");
     }
-    
-    String response = http.getString();
+
     lastError = "HTTP " + String(httpResponseCode);
-    Serial.print("[AUTH] Response: ");
-    Serial.println(response);
-    http.end();
     return false;
   }
-  
-  // Get response
-  String response = http.getString();
-  http.end();
-  
+
   Serial.println("[AUTH] Response received, parsing...");
   
   // Parse response
@@ -505,6 +544,8 @@ bool AuthenticationManager::sendVitals(const char* backendURL,
                                        int ppgCount,
                                        const float* ecg,
                                        int ecgCount) {
+  lastMLWarning = "";
+
   if (!isAuthenticated()) {
     lastError = "Not authenticated - no valid token";
     Serial.println("[AUTH] ERROR: Cannot send vitals - not authenticated");
@@ -542,20 +583,25 @@ bool AuthenticationManager::sendVitals(const char* backendURL,
   
   String response = http.getString();
   http.end();
+  logServerResponse("[AUTH][VITALS]", httpResponseCode, response);
   
   if (httpResponseCode != 200 && httpResponseCode != 201) {
     Serial.print("[AUTH] ERROR: HTTP ");
     Serial.print(httpResponseCode);
     Serial.println(" response");
-    Serial.print("[AUTH] Response: ");
-    Serial.println(response);
     lastError = "HTTP " + String(httpResponseCode);
     return false;
   }
   
-  Serial.println("[AUTH] ✓ Vitals sent successfully!");
-  Serial.print("[AUTH] Response: ");
-  Serial.println(response);
+  String mlWarning;
+  if (ppg && ppgCount > 0 && parseVitalsMLWarning(response, mlWarning)) {
+    lastMLWarning = mlWarning;
+    Serial.print("[AUTH][VITALS] Saved, but backend ML rejected this PPG window: ");
+    Serial.println(lastMLWarning);
+  } else {
+    Serial.println("[AUTH] Vitals saved successfully.");
+  }
+
   lastError = "";
   return true;
 }

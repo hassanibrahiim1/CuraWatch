@@ -216,8 +216,12 @@ void setup()
     Serial.println("  MAX30102 PPG capture profile:");
     Serial.println("    Sample rate: 200 Hz");
     Serial.println("    FIFO averaging: 1 (no decimation)");
-    Serial.println("    Raw capture window: 200 IR samples (~1.00 s)");
-    Serial.println("    Model window: 125 normalized PPG floats");
+    Serial.print("    Raw capture window: ");
+    Serial.print(PPGWindowBuilder::RAW_WINDOW_SAMPLES);
+    Serial.println(" IR samples (~3.00 s)");
+    Serial.print("    Upload window: ");
+    Serial.print(PPGWindowBuilder::MODEL_WINDOW_SAMPLES);
+    Serial.println(" normalized PPG floats");
   }
 
   delay(500);
@@ -408,7 +412,7 @@ void setup()
   }
 
   Serial.println("Vitals payload mode enabled.");
-  Serial.println("The sketch will add one 125-sample normalized PPG window to the old JSON.");
+  Serial.println("The sketch will add one cleaned 3-second normalized PPG window to the old JSON.");
   Serial.println("If the PPG window is not ready yet, it will not send.");
   }
 }
@@ -442,6 +446,14 @@ void loop()
       if (ppgWindowBuilder.addSample((float)ir, heartRateSensor.isFingerDetected())) {
         mlWindowPending = true;
         printMLWindowPreview();
+      } else if (ppgWindowBuilder.consumeRejectedWindowFlag()) {
+        Serial.println("[PPG WINDOW] Rejected noisy PPG capture; collecting a fresh window.");
+        Serial.print("  Raw min/max source range: ");
+        Serial.print(ppgWindowBuilder.getLastWindowMin(), 0);
+        Serial.print(" -> ");
+        Serial.println(ppgWindowBuilder.getLastWindowMax(), 0);
+        Serial.print("  Detected peaks: ");
+        Serial.println(ppgWindowBuilder.getLastWindowPeakCount());
       }
     }
     
@@ -785,11 +797,13 @@ void printMLWindowPreview()
   const float* ppgWindow = ppgWindowBuilder.getWindow();
 
   Serial.println("\n[PPG WINDOW]");
-  Serial.println("  One 125-sample PPG window is ready.");
-  Serial.print("  Normalized min/max source range: ");
+  Serial.println("  One cleaned 3-second PPG upload window is ready.");
+  Serial.print("  Raw min/max source range: ");
   Serial.print(ppgWindowBuilder.getLastWindowMin(), 0);
   Serial.print(" -> ");
   Serial.println(ppgWindowBuilder.getLastWindowMax(), 0);
+  Serial.print("  Detected peaks in source window: ");
+  Serial.println(ppgWindowBuilder.getLastWindowPeakCount());
   Serial.print("  Preview: ");
   for (int i = 0; i < 5; i++) {
     if (i > 0) {
@@ -836,7 +850,14 @@ void sendPPGWindowWithVitals()
   }
 
   if (authManager.sendVitals(BACKEND_URL, hr, spo2, steps, temperature, ppgWindow, ppgCount)) {
-    Serial.println("[PPG] Vitals + PPG window uploaded successfully.");
+    String mlWarning = authManager.getLastMLWarning();
+    if (mlWarning.isEmpty()) {
+      Serial.println("[PPG] Vitals + PPG window uploaded successfully.");
+    } else {
+      Serial.print("[PPG] Vitals saved, but ML still rejected this window: ");
+      Serial.println(mlWarning);
+      Serial.println("[PPG] Dropping this saved window and collecting a cleaner one.");
+    }
     ppgWindowBuilder.consumeWindow();
     mlWindowPending = false;
   } else {

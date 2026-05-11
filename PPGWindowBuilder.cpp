@@ -1,18 +1,29 @@
 #include "PPGWindowBuilder.h"
 
+const float PPGWindowBuilder::MIN_SIGNAL_RANGE = 350.0f;
+
 PPGWindowBuilder::PPGWindowBuilder()
-  : rawIndex(0), windowReady(false), lastWindowMin(0.0f), lastWindowMax(0.0f) {
+  : rawIndex(0),
+    windowReady(false),
+    lastRejectedWindow(false),
+    lastWindowMin(0.0f),
+    lastWindowMax(0.0f),
+    lastWindowPeakCount(0) {
   reset();
 }
 
 void PPGWindowBuilder::reset() {
   rawIndex = 0;
   windowReady = false;
+  lastRejectedWindow = false;
   lastWindowMin = 0.0f;
   lastWindowMax = 0.0f;
+  lastWindowPeakCount = 0;
 
   for (int i = 0; i < RAW_WINDOW_SAMPLES; i++) {
     rawSamples[i] = 0.0f;
+    smoothedSamples[i] = 0.0f;
+    filteredSamples[i] = 0.0f;
   }
 
   for (int i = 0; i < MODEL_WINDOW_SAMPLES; i++) {
@@ -36,9 +47,14 @@ bool PPGWindowBuilder::addSample(float rawSample, bool fingerDetected) {
     return false;
   }
 
-  buildWindow();
-  windowReady = true;
   rawIndex = 0;
+  if (!buildWindow()) {
+    lastRejectedWindow = true;
+    return false;
+  }
+
+  windowReady = true;
+  lastRejectedWindow = false;
   return true;
 }
 
@@ -62,15 +78,46 @@ float PPGWindowBuilder::getLastWindowMax() const {
   return lastWindowMax;
 }
 
+int PPGWindowBuilder::getLastWindowPeakCount() const {
+  return lastWindowPeakCount;
+}
+
+bool PPGWindowBuilder::consumeRejectedWindowFlag() {
+  bool rejected = lastRejectedWindow;
+  lastRejectedWindow = false;
+  return rejected;
+}
+
 void PPGWindowBuilder::consumeWindow() {
   windowReady = false;
 }
 
-void PPGWindowBuilder::buildWindow() {
-  float smoothed[RAW_WINDOW_SAMPLES];
-  smoothRawSamples(smoothed);
-  resampleLinear(smoothed, RAW_WINDOW_SAMPLES, modelWindow, MODEL_WINDOW_SAMPLES);
+bool PPGWindowBuilder::buildWindow() {
+  smoothRawSamples(smoothedSamples);
+
+  float rawMin = smoothedSamples[0];
+  float rawMax = smoothedSamples[0];
+  for (int i = 1; i < RAW_WINDOW_SAMPLES; i++) {
+    rawMin = min(rawMin, smoothedSamples[i]);
+    rawMax = max(rawMax, smoothedSamples[i]);
+  }
+
+  lastWindowMin = rawMin;
+  lastWindowMax = rawMax;
+  if ((rawMax - rawMin) < MIN_SIGNAL_RANGE) {
+    lastWindowPeakCount = 0;
+    return false;
+  }
+
+  removeBaselineDrift(smoothedSamples, filteredSamples, RAW_WINDOW_SAMPLES);
+  lastWindowPeakCount = countPulsePeaks(filteredSamples, RAW_WINDOW_SAMPLES);
+  if (lastWindowPeakCount < 2) {
+    return false;
+  }
+
+  resampleLinear(filteredSamples, RAW_WINDOW_SAMPLES, modelWindow, MODEL_WINDOW_SAMPLES);
   normalizeWindow(modelWindow, MODEL_WINDOW_SAMPLES);
+  return true;
 }
 
 void PPGWindowBuilder::smoothRawSamples(float* smoothed) const {
@@ -80,6 +127,70 @@ void PPGWindowBuilder::smoothRawSamples(float* smoothed) const {
     float next = rawSamples[(i == RAW_WINDOW_SAMPLES - 1) ? RAW_WINDOW_SAMPLES - 1 : i + 1];
     smoothed[i] = (previous + current + next) / 3.0f;
   }
+}
+
+void PPGWindowBuilder::removeBaselineDrift(const float* input,
+                                           float* output,
+                                           int count) const {
+  if (count <= 0) {
+    return;
+  }
+
+  for (int i = 0; i < count; i++) {
+    int left = max(0, i - BASELINE_RADIUS_SAMPLES);
+    int right = min(count - 1, i + BASELINE_RADIUS_SAMPLES);
+    float sum = 0.0f;
+
+    for (int j = left; j <= right; j++) {
+      sum += input[j];
+    }
+
+    float baseline = sum / (float)(right - left + 1);
+    output[i] = input[i] - baseline;
+  }
+}
+
+int PPGWindowBuilder::countPulsePeaks(const float* samples, int count) const {
+  if (count < 3) {
+    return 0;
+  }
+
+  float minValue = samples[0];
+  float maxValue = samples[0];
+  for (int i = 1; i < count; i++) {
+    minValue = min(minValue, samples[i]);
+    maxValue = max(maxValue, samples[i]);
+  }
+
+  float range = maxValue - minValue;
+  if (range < 1e-6f) {
+    return 0;
+  }
+
+  float peakThreshold = minValue + (range * 0.55f);
+  int peakCount = 0;
+  int lastPeakIndex = -MIN_PEAK_DISTANCE_SAMPLES;
+  float lastPeakValue = minValue;
+
+  for (int i = 1; i < count - 1; i++) {
+    bool isLocalPeak = samples[i] > peakThreshold &&
+                       samples[i] > samples[i - 1] &&
+                       samples[i] >= samples[i + 1];
+    if (!isLocalPeak) {
+      continue;
+    }
+
+    if (i - lastPeakIndex >= MIN_PEAK_DISTANCE_SAMPLES) {
+      peakCount++;
+      lastPeakIndex = i;
+      lastPeakValue = samples[i];
+    } else if (samples[i] > lastPeakValue) {
+      lastPeakIndex = i;
+      lastPeakValue = samples[i];
+    }
+  }
+
+  return peakCount;
 }
 
 void PPGWindowBuilder::resampleLinear(const float* input,
@@ -113,9 +224,6 @@ void PPGWindowBuilder::normalizeWindow(float* samples, int count) {
     minValue = min(minValue, samples[i]);
     maxValue = max(maxValue, samples[i]);
   }
-
-  lastWindowMin = minValue;
-  lastWindowMax = maxValue;
 
   float range = maxValue - minValue;
   if (range < 1e-6f) {

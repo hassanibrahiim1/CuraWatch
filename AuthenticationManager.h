@@ -53,6 +53,7 @@ public:
   
   // Error handling
   String getLastError() const { return lastError; }
+  String getLastMLWarning() const { return lastMLWarning; }
   
   // Debug method to check preferences state
   void debugPreferencesState();
@@ -62,6 +63,7 @@ private:
   String currentToken;
   unsigned long tokenSavedTime;
   String lastError;
+  String lastMLWarning;
   
   // Storage keys
   static const char* PREF_NAMESPACE;
@@ -74,7 +76,9 @@ private:
   
   // Helper functions
   bool parseLoginResponse(const String& jsonResponse, String& token, String& userId, String& fullName);
+  bool parseVitalsMLWarning(const String& jsonResponse, String& warning) const;
   String createAuthHeader() const;
+  void logServerResponse(const char* context, int httpResponseCode, const String& response) const;
 };
 
 #endif
