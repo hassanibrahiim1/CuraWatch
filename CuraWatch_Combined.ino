@@ -98,8 +98,8 @@ void testPreferences() {
 
 // Backend configuration
 #define BACKEND_URL "https://cura-watch.onrender.com"  // TODO: Change to your backend server IP/address
-#define PATIENT_EMAIL "mustafa.ahmed.00878@gmail.com"     // TODO: Change to your patient email
-#define PATIENT_PASSWORD "123456"             // TODO: Change to your patient password
+#define PATIENT_EMAIL "patientMail@main.com"     // TODO: Change to your patient email
+#define PATIENT_PASSWORD "password"             // TODO: Change to your patient password
 
 // Vitals sending interval (send every 60 seconds)
 #define VITALS_SEND_INTERVAL 60000
@@ -156,9 +156,9 @@ struct KnownAP {
 };
 
 const KnownAP knownAPs[] = {
-  {"Hassan", "6a:bb:30:8c:73:4f", "12345678"},     // ← UPDATE WITH REAL PASSWORD
-  {"Mohamed", "da:6c:44:b6:ee:05", "12345678"}, // ← UPDATE WITH REAL PASSWORD
-  {"MyHome", "58:d7:59:6c:fa:d0", "ibrahassan376236*"}      // ← UPDATE WITH REAL PASSWORD
+  {"AP1", "BBSID1", "password1"},     // ← UPDATE WITH REAL PASSWORD
+  {"AP2", "BBSID2", "password2"}, // ← UPDATE WITH REAL PASSWORD
+  {"AP3", "BBSID3", "password3"}      // ← UPDATE WITH REAL PASSWORD
 };
 
 const int NUM_KNOWN_APS = sizeof(knownAPs) / sizeof(knownAPs[0]);
